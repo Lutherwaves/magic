@@ -5,10 +5,12 @@ import (
 	"time"
 )
 
-// Note: These tests require a running Redis instance on localhost:6379 with password authentication
-// Run with: docker run -d -p 6379:6379 redis:alpine --requirepass testpass
+// Note: These tests gracefully skip if Redis is not available
+// To run tests with Redis: docker run -d -p 6379:6379 redis:alpine --requirepass testpass
 
 func TestRedisAdapter_SetAndGet(t *testing.T) {
+	ResetRedisAdapterInstance() // Reset singleton for clean test state
+	
 	config := map[string]string{
 		"addr":     "localhost:6379",
 		"password": "testpass",
@@ -52,6 +54,8 @@ func TestRedisAdapter_SetAndGet(t *testing.T) {
 }
 
 func TestRedisAdapter_CacheMiss(t *testing.T) {
+	ResetRedisAdapterInstance() // Reset singleton for clean test state
+	
 	config := map[string]string{
 		"addr":     "localhost:6379",
 		"password": "testpass",
@@ -75,6 +79,8 @@ func TestRedisAdapter_CacheMiss(t *testing.T) {
 }
 
 func TestRedisAdapter_Exists(t *testing.T) {
+	ResetRedisAdapterInstance() // Reset singleton for clean test state
+	
 	config := map[string]string{
 		"addr":     "localhost:6379",
 		"password": "testpass",
@@ -123,6 +129,8 @@ func TestRedisAdapter_Exists(t *testing.T) {
 }
 
 func TestRedisAdapter_Delete(t *testing.T) {
+	ResetRedisAdapterInstance() // Reset singleton for clean test state
+	
 	config := map[string]string{
 		"addr":     "localhost:6379",
 		"password": "testpass",
@@ -169,6 +177,8 @@ func TestRedisAdapter_Delete(t *testing.T) {
 }
 
 func TestRedisAdapter_TTL(t *testing.T) {
+	ResetRedisAdapterInstance() // Reset singleton for clean test state
+	
 	config := map[string]string{
 		"addr":     "localhost:6379",
 		"password": "testpass",
@@ -213,6 +223,8 @@ func TestRedisAdapter_TTL(t *testing.T) {
 }
 
 func TestRedisAdapter_GetType(t *testing.T) {
+	ResetRedisAdapterInstance() // Reset singleton for clean test state
+	
 	config := map[string]string{
 		"addr":     "localhost:6379",
 		"password": "testpass",

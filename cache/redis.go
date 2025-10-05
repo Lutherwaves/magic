@@ -33,6 +33,16 @@ func GetRedisAdapterInstance(config map[string]string) *RedisAdapter {
 	return redisAdapterInstance
 }
 
+// ResetRedisAdapterInstance resets the singleton instance (used for testing)
+func ResetRedisAdapterInstance() {
+	redisAdapterLock.Lock()
+	defer redisAdapterLock.Unlock()
+	if redisAdapterInstance != nil {
+		redisAdapterInstance.Close()
+		redisAdapterInstance = nil
+	}
+}
+
 // OpenConnection establishes a connection to Redis
 func (r *RedisAdapter) OpenConnection() {
 	addr := r.config["addr"]
@@ -65,12 +75,8 @@ func (r *RedisAdapter) OpenConnection() {
 		MinIdleConns: 5,
 	})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := r.client.Ping(ctx).Err(); err != nil {
-		logger.Fatal("failed to connect to redis", slog.Any("error", err.Error()))
-	}
+	// Note: We don't ping here to allow graceful handling of connection failures
+	// The caller should use Ping() to verify connectivity
 }
 
 // Get retrieves a value from Redis by key
