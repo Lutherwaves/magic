@@ -4,22 +4,42 @@ import (
 	"fmt"
 	"net/http"
 
+	"github.com/tink3rlabs/magic/cache"
 	"github.com/tink3rlabs/magic/storage"
 )
 
 type HealthChecker struct {
 	storage storage.StorageAdapter
+	cache   cache.CacheAdapter
 }
 
 func NewHealthChecker(storageAdapter storage.StorageAdapter) *HealthChecker {
 	return &HealthChecker{storage: storageAdapter}
 }
 
+func NewHealthCheckerWithCache(storageAdapter storage.StorageAdapter, cacheAdapter cache.CacheAdapter) *HealthChecker {
+	return &HealthChecker{
+		storage: storageAdapter,
+		cache:   cacheAdapter,
+	}
+}
+
 func (h *HealthChecker) Check(checkStorage bool, dependencies []string) error {
-	if checkStorage {
+	return h.CheckWithCache(checkStorage, false, dependencies)
+}
+
+func (h *HealthChecker) CheckWithCache(checkStorage bool, checkCache bool, dependencies []string) error {
+	if checkStorage && h.storage != nil {
 		err := h.storage.Ping()
 		if err != nil {
 			return fmt.Errorf("health check failure: storage check failed: %v", err)
+		}
+	}
+
+	if checkCache && h.cache != nil {
+		err := h.cache.Ping()
+		if err != nil {
+			return fmt.Errorf("health check failure: cache check failed: %v", err)
 		}
 	}
 
