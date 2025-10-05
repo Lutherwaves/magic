@@ -37,10 +37,13 @@ func GetRedisAdapterInstance(config map[string]string) *RedisAdapter {
 func (r *RedisAdapter) OpenConnection() {
 	addr := r.config["addr"]
 	if addr == "" {
-		addr = "localhost:6379"
+		logger.Fatal("redis address is required", slog.String("error", "addr config cannot be empty"))
 	}
 
 	password := r.config["password"]
+	if password == "" || password == "off" {
+		logger.Fatal("redis password is required", slog.String("error", "password config cannot be empty or 'off'"))
+	}
 	
 	db := 0
 	if dbStr, ok := r.config["db"]; ok && dbStr != "" {

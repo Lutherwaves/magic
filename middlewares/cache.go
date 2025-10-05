@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/tink3rlabs/magic/cache"
-	"github.com/tink3rlabs/magic/logger"
 )
 
 // CacheConfig holds the configuration for the cache middleware
@@ -111,7 +110,7 @@ func CacheMiddleware(config CacheConfig) func(http.Handler) http.Handler {
 				// Cache hit - unmarshal and return cached response
 				var cached cachedResponse
 				if err := json.Unmarshal(cachedData, &cached); err != nil {
-					logger.Warn("failed to unmarshal cached response", slog.Any("error", err.Error()))
+					slog.Warn("failed to unmarshal cached response", slog.Any("error", err.Error()))
 				} else {
 					// Write cached response
 					for key, values := range cached.Headers {
@@ -126,7 +125,7 @@ func CacheMiddleware(config CacheConfig) func(http.Handler) http.Handler {
 				}
 			} else if err != cache.ErrCacheMiss {
 				// Log cache errors but don't fail the request
-				logger.Warn("cache get error", slog.Any("error", err.Error()))
+				slog.Warn("cache get error", slog.Any("error", err.Error()))
 			}
 
 			// Cache miss - capture response
@@ -152,7 +151,7 @@ func CacheMiddleware(config CacheConfig) func(http.Handler) http.Handler {
 				// Marshal and store in cache
 				cachedData, err := json.Marshal(cached)
 				if err != nil {
-					logger.Warn("failed to marshal response for caching", slog.Any("error", err.Error()))
+					slog.Warn("failed to marshal response for caching", slog.Any("error", err.Error()))
 				} else {
 					// Determine TTL (can be customized per request via header)
 					ttl := config.TTL
@@ -163,7 +162,7 @@ func CacheMiddleware(config CacheConfig) func(http.Handler) http.Handler {
 					}
 
 					if err := config.Adapter.Set(cacheKey, cachedData, ttl); err != nil {
-						logger.Warn("failed to cache response", slog.Any("error", err.Error()))
+						slog.Warn("failed to cache response", slog.Any("error", err.Error()))
 					}
 				}
 			}
@@ -189,9 +188,9 @@ func InvalidateCacheMiddleware(cacheAdapter cache.CacheAdapter, keyPrefix string
 				
 				// Attempt to delete the cache entry
 				if err := cacheAdapter.Delete(cacheKey); err != nil {
-					logger.Warn("failed to invalidate cache", 
-						slog.String("key", cacheKey),
-						slog.Any("error", err.Error()))
+				slog.Warn("failed to invalidate cache", 
+					slog.String("key", cacheKey),
+					slog.Any("error", err.Error()))
 				}
 			}
 
