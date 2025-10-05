@@ -118,10 +118,12 @@ func CacheMiddleware(config CacheConfig) func(http.Handler) http.Handler {
 							w.Header().Add(key, value)
 						}
 					}
-					w.Header().Set(config.CacheStatusHeader, "HIT")
-					w.WriteHeader(cached.StatusCode)
-					w.Write(cached.Body)
-					return
+				w.Header().Set(config.CacheStatusHeader, "HIT")
+				w.WriteHeader(cached.StatusCode)
+				if _, err := w.Write(cached.Body); err != nil {
+					slog.Warn("failed to write cached response body", slog.Any("error", err.Error()))
+				}
+				return
 				}
 			} else if err != cache.ErrCacheMiss {
 				// Log cache errors but don't fail the request

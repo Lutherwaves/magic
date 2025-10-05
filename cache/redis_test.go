@@ -5,13 +5,13 @@ import (
 	"time"
 )
 
-// Note: These tests require a running Redis instance on localhost:6379
-// Run with: docker run -d -p 6379:6379 redis:alpine
+// Note: These tests require a running Redis instance on localhost:6379 with password authentication
+// Run with: docker run -d -p 6379:6379 redis:alpine --requirepass testpass
 
 func TestRedisAdapter_SetAndGet(t *testing.T) {
 	config := map[string]string{
 		"addr":     "localhost:6379",
-		"password": "",
+		"password": "testpass",
 		"db":       "0",
 	}
 
@@ -46,12 +46,15 @@ func TestRedisAdapter_SetAndGet(t *testing.T) {
 	}
 
 	// Cleanup
-	adapter.Delete(key)
+	if err := adapter.Delete(key); err != nil {
+		t.Logf("Cleanup failed: %v", err)
+	}
 }
 
 func TestRedisAdapter_CacheMiss(t *testing.T) {
 	config := map[string]string{
-		"addr": "localhost:6379",
+		"addr":     "localhost:6379",
+		"password": "testpass",
 	}
 
 	adapter, err := CacheAdapterFactory{}.GetInstance(REDIS, config)
@@ -73,7 +76,8 @@ func TestRedisAdapter_CacheMiss(t *testing.T) {
 
 func TestRedisAdapter_Exists(t *testing.T) {
 	config := map[string]string{
-		"addr": "localhost:6379",
+		"addr":     "localhost:6379",
+		"password": "testpass",
 	}
 
 	adapter, err := CacheAdapterFactory{}.GetInstance(REDIS, config)
@@ -99,7 +103,9 @@ func TestRedisAdapter_Exists(t *testing.T) {
 	}
 
 	// Set the key
-	adapter.Set(key, value, time.Minute)
+	if err := adapter.Set(key, value, time.Minute); err != nil {
+		t.Fatalf("Failed to set key: %v", err)
+	}
 
 	// Key should now exist
 	exists, err = adapter.Exists(key)
@@ -111,12 +117,15 @@ func TestRedisAdapter_Exists(t *testing.T) {
 	}
 
 	// Cleanup
-	adapter.Delete(key)
+	if err := adapter.Delete(key); err != nil {
+		t.Logf("Cleanup failed: %v", err)
+	}
 }
 
 func TestRedisAdapter_Delete(t *testing.T) {
 	config := map[string]string{
-		"addr": "localhost:6379",
+		"addr":     "localhost:6379",
+		"password": "testpass",
 	}
 
 	adapter, err := CacheAdapterFactory{}.GetInstance(REDIS, config)
@@ -133,7 +142,9 @@ func TestRedisAdapter_Delete(t *testing.T) {
 	value := []byte("test")
 
 	// Set a value
-	adapter.Set(key, value, time.Minute)
+	if err := adapter.Set(key, value, time.Minute); err != nil {
+		t.Fatalf("Failed to set value: %v", err)
+	}
 
 	// Verify it exists
 	retrieved, err := adapter.Get(key)
@@ -159,7 +170,8 @@ func TestRedisAdapter_Delete(t *testing.T) {
 
 func TestRedisAdapter_TTL(t *testing.T) {
 	config := map[string]string{
-		"addr": "localhost:6379",
+		"addr":     "localhost:6379",
+		"password": "testpass",
 	}
 
 	adapter, err := CacheAdapterFactory{}.GetInstance(REDIS, config)
@@ -177,7 +189,9 @@ func TestRedisAdapter_TTL(t *testing.T) {
 	ttl := 2 * time.Second
 
 	// Set with short TTL
-	adapter.Set(key, value, ttl)
+	if err := adapter.Set(key, value, ttl); err != nil {
+		t.Fatalf("Failed to set value: %v", err)
+	}
 
 	// Verify it exists
 	retrieved, err := adapter.Get(key)
@@ -200,7 +214,8 @@ func TestRedisAdapter_TTL(t *testing.T) {
 
 func TestRedisAdapter_GetType(t *testing.T) {
 	config := map[string]string{
-		"addr": "localhost:6379",
+		"addr":     "localhost:6379",
+		"password": "testpass",
 	}
 
 	adapter, err := CacheAdapterFactory{}.GetInstance(REDIS, config)
