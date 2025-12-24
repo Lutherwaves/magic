@@ -44,14 +44,25 @@ const (
 	matchContains
 )
 
+type ComparisonOperator string
+
+const (
+	OpEqual              ComparisonOperator = "="
+	OpGreaterThan        ComparisonOperator = ">"
+	OpGreaterThanOrEqual ComparisonOperator = ">="
+	OpLessThan           ComparisonOperator = "<"
+	OpLessThanOrEqual    ComparisonOperator = "<="
+)
+
 type Node struct {
-	Type      NodeType
-	Field     string
-	Value     string
-	Operator  LogicalOperator
-	Children  []*Node
-	Negate    bool
-	MatchType MatchType
+	Type       NodeType
+	Field      string
+	Value      string
+	Operator   LogicalOperator
+	Comparison ComparisonOperator // For range queries
+	Children   []*Node
+	Negate     bool
+	MatchType  MatchType
 }
 
 func NewParserFromType(model any) (*Parser, error) {
@@ -101,6 +112,12 @@ func getStructFields(model any) ([]FieldInfo, error) {
 }
 
 func (p *Parser) ParseToMap(query string) (map[string]any, error) {
+	// Try enhanced parser first for full Lucene syntax support
+	if ep := p.tryEnhancedParser(query); ep != nil {
+		return ep.ParseToMap(query)
+	}
+
+	// Fallback to legacy parser
 	node, err := p.parse(query)
 	if err != nil {
 		return nil, err
@@ -110,6 +127,13 @@ func (p *Parser) ParseToMap(query string) (map[string]any, error) {
 
 func (p *Parser) ParseToSQL(query string) (string, []any, error) {
 	slog.Debug(fmt.Sprintf(`Parsing query to sql: %s`, query))
+
+	// Try enhanced parser first for full Lucene syntax support
+	if ep := p.tryEnhancedParser(query); ep != nil {
+		return ep.ParseToSQL(query)
+	}
+
+	// Fallback to legacy parser
 	re := regexp.MustCompile(`(\w+):"([^"]+)"`)
 	query = re.ReplaceAllString(query, `$1:$2`)
 	node, err := p.parse(query)
@@ -117,6 +141,28 @@ func (p *Parser) ParseToSQL(query string) (string, []any, error) {
 		return "", nil, err
 	}
 	return p.nodeToSQL(node)
+}
+
+// tryEnhancedParser checks if the query uses enhanced Lucene syntax
+func (p *Parser) tryEnhancedParser(query string) *EnhancedParser {
+	// Check for enhanced syntax features
+	hasEnhancedSyntax := strings.Contains(query, "&&") ||
+		strings.Contains(query, "||") ||
+		strings.Contains(query, "!") ||
+		strings.Contains(query, "[") ||
+		strings.Contains(query, "{") ||
+		strings.Contains(query, " TO ") ||
+		strings.Contains(query, "~") ||
+		strings.Contains(query, "^") ||
+		strings.HasPrefix(strings.TrimSpace(query), "+") ||
+		strings.HasPrefix(strings.TrimSpace(query), "-") ||
+		strings.Contains(query, " +") ||
+		strings.Contains(query, " -")
+
+	if hasEnhancedSyntax {
+		return NewEnhancedParser(p.DefaultFields)
+	}
+	return nil
 }
 
 func (p *Parser) parse(query string) (*Node, error) {
@@ -436,6 +482,13 @@ func (p *Parser) nodeToSQL(node *Node) (string, []any, error) {
 
 func (p *Parser) ParseToDynamoDBPartiQL(query string) (string, []types.AttributeValue, error) {
 	slog.Debug(fmt.Sprintf(`Parsing query to DynamoDB PartiQL: %s`, query))
+
+	// Try enhanced parser first for full Lucene syntax support
+	if ep := p.tryEnhancedParser(query); ep != nil {
+		return ep.ParseToDynamoDBPartiQL(query)
+	}
+
+	// Fallback to legacy parser
 	node, err := p.parse(query)
 	if err != nil {
 		return "", nil, err
