@@ -99,9 +99,11 @@ func (p *PostgresJSONBDriver) renderParamInternal(e *expr.Expression) (string, [
 
 	// Special handling for Range operator - handle open-ended ranges with *
 	if e.Op == expr.Range {
+		fmt.Printf("DEBUG renderParamInternal: detected Range operator, calling renderRange\n")
 		return p.renderRange(e)
 	}
 
+	fmt.Printf("DEBUG renderParamInternal: Op=%v, delegating to Base.RenderParam\n", e.Op)
 	// Use base implementation for all other operators
 	return p.Base.RenderParam(e)
 }
@@ -274,11 +276,14 @@ func extractLiteralValue(v any) string {
 
 // renderRange handles range expressions with support for open-ended ranges (*).
 func (p *PostgresJSONBDriver) renderRange(e *expr.Expression) (string, []any, error) {
+	fmt.Printf("DEBUG renderRange: CALLED for expression: %v\n", e)
+
 	// Get column name
 	colStr, _, err := p.serializeColumn(e.Left)
 	if err != nil {
 		return "", nil, err
 	}
+	fmt.Printf("DEBUG renderRange: colStr=%q\n", colStr)
 
 	// The Right side should be a RangeBoundary
 	rangeBoundary, ok := e.Right.(*expr.RangeBoundary)
@@ -293,12 +298,17 @@ func (p *PostgresJSONBDriver) renderRange(e *expr.Expression) (string, []any, er
 	// Extract Min value
 	if rangeBoundary.Min != nil {
 		minVal = extractLiteralValue(rangeBoundary.Min)
+		fmt.Printf("DEBUG renderRange: extracted minVal=%q (from type=%T)\n", minVal, rangeBoundary.Min)
 	}
 
 	// Extract Max value
 	if rangeBoundary.Max != nil {
 		maxVal = extractLiteralValue(rangeBoundary.Max)
+		fmt.Printf("DEBUG renderRange: extracted maxVal=%q (from type=%T)\n", maxVal, rangeBoundary.Max)
 	}
+
+	fmt.Printf("DEBUG renderRange: checking - minVal=%q maxVal=%q, minVal==\"*\"?%v maxVal==\"*\"?%v\n",
+		minVal, maxVal, minVal == "*", maxVal == "*")
 
 	// Handle open-ended ranges
 	if minVal == "*" && maxVal == "*" {
