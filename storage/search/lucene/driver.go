@@ -29,10 +29,10 @@ func NewPostgresJSONBDriver(fields []FieldInfo) *PostgresJSONBDriver {
 		expr.Or:        driver.Shared[expr.Or],
 		expr.Not:       driver.Shared[expr.Not],
 		expr.Equals:    customPostgresEquals,    // Custom to handle JSONB syntax
-		expr.Range:     driver.Shared[expr.Range],
+		expr.Range:     driver.Shared[expr.Range], // Handled in renderParamInternal
 		expr.Must:      driver.Shared[expr.Must],
 		expr.MustNot:   driver.Shared[expr.MustNot],
-		expr.Wild:      driver.Shared[expr.Wild],
+		expr.Wild:      customPostgresWild,      // Custom to use ILIKE instead of SIMILAR TO
 		expr.Regexp:    driver.Shared[expr.Regexp],
 		expr.Like:      customPostgresLike,      // Custom LIKE to use ILIKE
 		expr.Greater:   customPostgresComparison(">"),
@@ -68,7 +68,7 @@ func (p *PostgresJSONBDriver) RenderParam(e *expr.Expression) (string, []any, er
 	return str, params, nil
 }
 
-// renderParamInternal handles rendering with special ILIKE logic.
+// renderParamInternal handles rendering with special ILIKE and Range logic.
 func (p *PostgresJSONBDriver) renderParamInternal(e *expr.Expression) (string, []any, error) {
 	if e == nil {
 		return "", nil, nil
@@ -95,6 +95,11 @@ func (p *PostgresJSONBDriver) renderParamInternal(e *expr.Expression) (string, [
 			return fmt.Sprintf("%s ILIKE %s", leftStr, rightStr), params, nil
 		}
 		return fmt.Sprintf("%s::text ILIKE %s", leftStr, rightStr), params, nil
+	}
+
+	// Special handling for Range operator - handle open-ended ranges with *
+	if e.Op == expr.Range {
+		return p.renderRange(e)
 	}
 
 	// Use base implementation for all other operators
@@ -239,6 +244,91 @@ func customPostgresLike(left, right string) (string, error) {
 		return fmt.Sprintf("%s ILIKE %s", left, right), nil
 	}
 	return fmt.Sprintf("%s::text ILIKE %s", left, right), nil
+}
+
+// customPostgresWild implements wildcard matching using ILIKE instead of SIMILAR TO.
+func customPostgresWild(left, right string) (string, error) {
+	// Delegate to LIKE handler which already handles wildcards correctly
+	return customPostgresLike(left, right)
+}
+
+// extractLiteralValue extracts the literal value from an expression or returns it as-is.
+func extractLiteralValue(v any) string {
+	if v == nil {
+		return ""
+	}
+
+	// If it's an expression, try to extract the Left value (for LITERAL expressions)
+	if ex, ok := v.(*expr.Expression); ok {
+		if ex.Op == expr.Literal && ex.Left != nil {
+			// LITERAL expressions store the actual value in Left
+			return fmt.Sprintf("%v", ex.Left)
+		}
+		// For other expression types, return the string representation
+		return fmt.Sprintf("%v", v)
+	}
+
+	// For non-expression types, return as string
+	return fmt.Sprintf("%v", v)
+}
+
+// renderRange handles range expressions with support for open-ended ranges (*).
+func (p *PostgresJSONBDriver) renderRange(e *expr.Expression) (string, []any, error) {
+	// Get column name
+	colStr, _, err := p.serializeColumn(e.Left)
+	if err != nil {
+		return "", nil, err
+	}
+
+	// The Right side should be a RangeBoundary
+	rangeBoundary, ok := e.Right.(*expr.RangeBoundary)
+	if !ok {
+		return "", nil, fmt.Errorf("invalid range expression structure: expected *expr.RangeBoundary, got %T", e.Right)
+	}
+
+	// Extract min and max values by rendering them
+	var minVal, maxVal string
+	var params []any
+
+	// Extract Min value
+	if rangeBoundary.Min != nil {
+		minVal = extractLiteralValue(rangeBoundary.Min)
+	}
+
+	// Extract Max value
+	if rangeBoundary.Max != nil {
+		maxVal = extractLiteralValue(rangeBoundary.Max)
+	}
+
+	// Handle open-ended ranges
+	if minVal == "*" && maxVal == "*" {
+		return "", nil, fmt.Errorf("both range bounds cannot be wildcards")
+	}
+
+	if minVal == "*" {
+		// [* TO max] or {* TO max}
+		params = append(params, maxVal)
+		if rangeBoundary.Inclusive {
+			return fmt.Sprintf("%s <= ?", colStr), params, nil
+		}
+		return fmt.Sprintf("%s < ?", colStr), params, nil
+	}
+
+	if maxVal == "*" {
+		// [min TO *] or {min TO *}
+		params = append(params, minVal)
+		if rangeBoundary.Inclusive {
+			return fmt.Sprintf("%s >= ?", colStr), params, nil
+		}
+		return fmt.Sprintf("%s > ?", colStr), params, nil
+	}
+
+	// Both bounds specified
+	params = append(params, minVal, maxVal)
+	if rangeBoundary.Inclusive {
+		return fmt.Sprintf("%s BETWEEN ? AND ?", colStr), params, nil
+	}
+	return fmt.Sprintf("(%s > ? AND %s < ?)", colStr, colStr), params, nil
 }
 
 // DynamoDBPartiQLDriver converts Lucene queries to DynamoDB PartiQL.

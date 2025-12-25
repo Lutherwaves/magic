@@ -173,7 +173,7 @@ func TestRangeQueries(t *testing.T) {
 		{
 			name:    "inclusive range",
 			query:   "age:[18 TO 65]",
-			wantSQL: []string{`"age" >=`, `"age" <=`},
+			wantSQL: []string{`"age" BETWEEN`},
 		},
 		{
 			name:    "exclusive range",
