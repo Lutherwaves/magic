@@ -5,16 +5,6 @@ import (
 	"testing"
 )
 
-// Test helper to check if SQL contains expected patterns
-func containsSQL(sql string, patterns ...string) bool {
-	for _, pattern := range patterns {
-		if !strings.Contains(sql, pattern) {
-			return false
-		}
-	}
-	return true
-}
-
 // TestBasicFieldSearch tests basic field:value queries
 func TestBasicFieldSearch(t *testing.T) {
 	fields := []FieldInfo{

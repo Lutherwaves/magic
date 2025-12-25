@@ -400,7 +400,7 @@ func (p *Parser) parsePhrase() (*EnhancedNode, error) {
 	if p.current.Type == TokenTilde {
 		p.advance()
 		if p.current.Type == TokenNumber {
-			fmt.Sscanf(p.current.Value, "%d", &proximity)
+			_, _ = fmt.Sscanf(p.current.Value, "%d", &proximity)
 			p.advance()
 		}
 	}
@@ -410,7 +410,7 @@ func (p *Parser) parsePhrase() (*EnhancedNode, error) {
 	if p.current.Type == TokenCaret {
 		p.advance()
 		if p.current.Type == TokenNumber {
-			fmt.Sscanf(p.current.Value, "%f", &boost)
+			_, _ = fmt.Sscanf(p.current.Value, "%f", &boost)
 			p.advance()
 		}
 	}
@@ -470,7 +470,7 @@ func (p *Parser) parseTerm() (*EnhancedNode, error) {
 			if p.current.Type == TokenTilde {
 				p.advance()
 				if p.current.Type == TokenNumber {
-					fmt.Sscanf(p.current.Value, "%d", &proximity)
+					_, _ = fmt.Sscanf(p.current.Value, "%d", &proximity)
 					p.advance()
 				}
 			}
@@ -480,7 +480,7 @@ func (p *Parser) parseTerm() (*EnhancedNode, error) {
 			if p.current.Type == TokenCaret {
 				p.advance()
 				if p.current.Type == TokenNumber {
-					fmt.Sscanf(p.current.Value, "%f", &boost)
+					_, _ = fmt.Sscanf(p.current.Value, "%f", &boost)
 					p.advance()
 				}
 			}
@@ -530,7 +530,7 @@ func (p *Parser) parseTerm() (*EnhancedNode, error) {
 		if p.current.Type == TokenTilde {
 			p.advance()
 			if p.current.Type == TokenNumber {
-				fmt.Sscanf(p.current.Value, "%d", &fuzzy)
+				_, _ = fmt.Sscanf(p.current.Value, "%d", &fuzzy)
 				p.advance()
 			} else {
 				fuzzy = 2 // Default fuzzy distance
@@ -542,7 +542,7 @@ func (p *Parser) parseTerm() (*EnhancedNode, error) {
 		if p.current.Type == TokenCaret {
 			p.advance()
 			if p.current.Type == TokenNumber {
-				fmt.Sscanf(p.current.Value, "%f", &boost)
+				_, _ = fmt.Sscanf(p.current.Value, "%f", &boost)
 				p.advance()
 			}
 		}
@@ -636,7 +636,7 @@ func (p *Parser) parseRange(field string) (*EnhancedNode, error) {
 	if p.current.Type == TokenCaret {
 		p.advance()
 		if p.current.Type == TokenNumber {
-			fmt.Sscanf(p.current.Value, "%f", &boost)
+			_, _ = fmt.Sscanf(p.current.Value, "%f", &boost)
 			p.advance()
 		}
 	}
@@ -683,13 +683,11 @@ func (p *Parser) createImplicitSearch(term string) (*EnhancedNode, error) {
 
 		formattedField := p.formatFieldName(field.Name)
 
-		// Determine if wildcard
-		nodeType := NodeTerm
-		matchType := matchContains // Default to contains for implicit search
+		// Implicit search always uses wildcard with contains by default
+		matchType := matchContains
 		processedValue := term
 
 		if strings.Contains(term, "*") || strings.Contains(term, "?") {
-			nodeType = NodeWildcard
 			if strings.HasPrefix(term, "*") && strings.HasSuffix(term, "*") {
 				matchType = matchContains
 				processedValue = strings.Trim(term, "*")
@@ -703,12 +701,10 @@ func (p *Parser) createImplicitSearch(term string) (*EnhancedNode, error) {
 				matchType = matchContains
 				processedValue = strings.ReplaceAll(strings.ReplaceAll(term, "*", "%"), "?", "_")
 			}
-		} else {
-			nodeType = NodeWildcard // Use wildcard with contains for implicit
 		}
 
 		children = append(children, &Node{
-			Type:      nodeType,
+			Type:      NodeWildcard, // Implicit search always uses wildcard
 			Field:     formattedField,
 			Value:     processedValue,
 			MatchType: matchType,
@@ -818,24 +814,24 @@ func (p *Parser) enhancedNodeToMap(node *EnhancedNode) map[string]any {
 	}
 
 	var result map[string]any
-	
+
 	// Convert base node to map
-	switch node.Node.Type {
+	switch node.Type {
 	case NodeTerm:
-		result = map[string]any{node.Node.Field: node.Node.Value}
+		result = map[string]any{node.Field: node.Value}
 	case NodeWildcard:
-		result = map[string]any{node.Node.Field: map[string]string{
-			"$like": wildcardToPattern(node.Node.Value, node.Node.MatchType),
+		result = map[string]any{node.Field: map[string]string{
+			"$like": wildcardToPattern(node.Value, node.MatchType),
 		}}
 	case NodeLogical:
 		result = make(map[string]any)
-		children := make([]map[string]any, 0, len(node.Node.Children))
-		for _, child := range node.Node.Children {
+		children := make([]map[string]any, 0, len(node.Children))
+		for _, child := range node.Children {
 			// Convert plain node to enhanced node for recursive processing
 			enhancedChild := &EnhancedNode{Node: child}
 			children = append(children, p.enhancedNodeToMap(enhancedChild))
 		}
-		result[string(node.Node.Operator)] = children
+		result[string(node.Operator)] = children
 	default:
 		result = make(map[string]any)
 	}
@@ -889,10 +885,10 @@ func (p *Parser) enhancedNodeToSQL(node *EnhancedNode) (string, []any, error) {
 	// For required, just process normally (required is implicit in AND)
 	// For boost, ignore in SQL (no relevance scoring)
 	// For fuzzy, approximate with LIKE wildcards
-	if node.Fuzzy > 0 && node.Node.Type == NodeTerm {
+	if node.Fuzzy > 0 && node.Type == NodeTerm {
 		// Convert fuzzy to wildcard search
-		node.Node.Type = NodeWildcard
-		node.Node.MatchType = matchContains
+		node.Type = NodeWildcard
+		node.MatchType = matchContains
 	}
 
 	// For proximity searches, treat as phrase match (best effort)
@@ -1028,9 +1024,9 @@ func (p *Parser) enhancedNodeToDynamoDBPartiQL(node *EnhancedNode) (string, []ty
 	}
 
 	// For fuzzy, approximate with contains
-	if node.Fuzzy > 0 && node.Node.Type == NodeTerm {
-		node.Node.Type = NodeWildcard
-		node.Node.MatchType = matchContains
+	if node.Fuzzy > 0 && node.Type == NodeTerm {
+		node.Type = NodeWildcard
+		node.MatchType = matchContains
 	}
 
 	return p.enhancedNodeToDynamoDBPartiQLInternal(node.Node)
