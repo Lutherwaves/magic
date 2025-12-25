@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"log/slog"
 	"reflect"
-	"regexp"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -22,6 +21,26 @@ type FieldInfo struct {
 	IsJSONB bool
 }
 
+// RangeNode represents a range query [min TO max] or {min TO max}
+type RangeNode struct {
+	Field     string
+	Min       string
+	Max       string
+	Inclusive bool // true for [], false for {}
+}
+
+// EnhancedNode extends Node with additional Lucene features
+type EnhancedNode struct {
+	*Node
+	Required   bool    // + operator
+	Prohibited bool    // - operator
+	Boost      float64 // ^ operator
+	Proximity  int     // ~n for phrases
+	Fuzzy      int     // ~n for terms
+	IsPhrase   bool    // quoted string
+	RangeInfo  *RangeNode
+}
+
 type Parser struct {
 	DefaultFields []FieldInfo
 
@@ -32,6 +51,11 @@ type Parser struct {
 
 	// Internal tracking
 	termCount int // Tracks number of terms during parsing
+
+	// Lexer state
+	lexer   *Lexer
+	current Token
+	peek    Token
 }
 
 type NodeType int
@@ -40,6 +64,10 @@ const (
 	NodeTerm NodeType = iota
 	NodeWildcard
 	NodeLogical
+	NodePhrase
+	NodeRange
+	NodeFuzzy
+	NodeProximity
 )
 
 type LogicalOperator string
@@ -140,21 +168,15 @@ func (p *Parser) ParseToMap(query string) (map[string]any, error) {
 	// Reset term counter for this parse
 	p.termCount = 0
 
-	// Try enhanced parser first for full Lucene syntax support
-	if ep := p.tryEnhancedParser(query); ep != nil {
-		return ep.ParseToMap(query)
-	}
-
-	// Fallback to legacy parser
-	node, err := p.parseWithDepth(query, 0)
+	node, err := p.parse(query)
 	if err != nil {
 		return nil, err
 	}
-	return p.nodeToMap(node), nil
+	return p.enhancedNodeToMap(node), nil
 }
 
 func (p *Parser) ParseToSQL(query string) (string, []any, error) {
-	slog.Debug(fmt.Sprintf(`Parsing query to sql: %s`, query))
+	slog.Debug(fmt.Sprintf(`Parsing query to SQL: %s`, query))
 
 	// Security: Validate query length (OWASP A04: DoS prevention)
 	if len(query) > p.MaxQueryLength {
@@ -164,205 +186,614 @@ func (p *Parser) ParseToSQL(query string) (string, []any, error) {
 	// Reset term counter for this parse
 	p.termCount = 0
 
-	// Try enhanced parser first for full Lucene syntax support
-	if ep := p.tryEnhancedParser(query); ep != nil {
-		return ep.ParseToSQL(query)
-	}
-
-	// Fallback to legacy parser
-	re := regexp.MustCompile(`(\w+):"([^"]+)"`)
-	query = re.ReplaceAllString(query, `$1:$2`)
-	node, err := p.parseWithDepth(query, 0)
+	node, err := p.parse(query)
 	if err != nil {
 		return "", nil, err
 	}
-	return p.nodeToSQL(node)
+
+	return p.enhancedNodeToSQL(node)
 }
 
-// tryEnhancedParser checks if the query uses enhanced Lucene syntax
-func (p *Parser) tryEnhancedParser(query string) *EnhancedParser {
-	// Check for enhanced syntax features
-	hasEnhancedSyntax := strings.Contains(query, "&&") ||
-		strings.Contains(query, "||") ||
-		strings.Contains(query, "!") ||
-		strings.Contains(query, "[") ||
-		strings.Contains(query, "{") ||
-		strings.Contains(query, " TO ") ||
-		strings.Contains(query, "~") ||
-		strings.Contains(query, "^") ||
-		strings.HasPrefix(strings.TrimSpace(query), "+") ||
-		strings.HasPrefix(strings.TrimSpace(query), "-") ||
-		strings.Contains(query, " +") ||
-		strings.Contains(query, " -")
+func (p *Parser) ParseToDynamoDBPartiQL(query string) (string, []types.AttributeValue, error) {
+	slog.Debug(fmt.Sprintf(`Parsing query to DynamoDB PartiQL: %s`, query))
 
-	if hasEnhancedSyntax {
-		ep := NewEnhancedParser(p.DefaultFields)
-		// Transfer security limits from parent parser
-		ep.MaxQueryLength = p.MaxQueryLength
-		ep.MaxDepth = p.MaxDepth
-		ep.MaxTerms = p.MaxTerms
-		return ep
+	// Security: Validate query length (OWASP A04: DoS prevention)
+	if len(query) > p.MaxQueryLength {
+		return "", nil, fmt.Errorf("query too long: %d bytes exceeds maximum of %d bytes", len(query), p.MaxQueryLength)
 	}
-	return nil
+
+	// Reset term counter for this parse
+	p.termCount = 0
+
+	node, err := p.parse(query)
+	if err != nil {
+		return "", nil, err
+	}
+
+	return p.enhancedNodeToDynamoDBPartiQL(node)
 }
 
-// parseWithDepth parses a query with depth tracking to prevent stack overflow
-func (p *Parser) parseWithDepth(query string, depth int) (*Node, error) {
-	// Security: Check nesting depth (OWASP A04: DoS prevention)
-	if depth > p.MaxDepth {
-		return nil, fmt.Errorf("query nesting too deep: depth %d exceeds maximum of %d", depth, p.MaxDepth)
-	}
-
+// parse parses the query string into an enhanced AST using the lexer
+func (p *Parser) parse(query string) (*EnhancedNode, error) {
 	query = strings.TrimSpace(query)
 	if query == "" {
 		return nil, nil
 	}
 
-	if strings.HasPrefix(query, "(") && strings.HasSuffix(query, ")") {
-		return p.parseWithDepth(query[1:len(query)-1], depth+1)
-	}
+	p.lexer = NewLexer(query)
+	p.advance() // Load first token
+	p.advance() // Load peek token
 
-	if andParts := splitByOperator(query, "AND"); len(andParts) > 1 {
-		return p.createLogicalNodeWithDepth(AND, andParts, depth)
-	}
-	if orParts := splitByOperator(query, "OR"); len(orParts) > 1 {
-		return p.createLogicalNodeWithDepth(OR, orParts, depth)
-	}
-	if notParts := splitByOperator(query, "NOT"); len(notParts) > 1 {
-		return p.createLogicalNodeWithDepth(NOT, notParts, depth)
-	}
-
-	if parts := strings.SplitN(query, ":", 2); len(parts) == 2 {
-		field := strings.TrimSpace(parts[0])
-		value := strings.TrimSpace(parts[1])
-		// Skip empty fields or values
-		if field == "" || value == "" {
-			return nil, nil
-		}
-		return p.createTermNode(field, value)
-	}
-
-	// Skip empty implicit terms
-	if query = strings.TrimSpace(query); query == "" {
-		return nil, nil
-	}
-
-	return p.createImplicitNode(query)
+	return p.parseExpressionWithDepth(0)
 }
 
-func splitByOperator(input string, op string) []string {
-	// Handle case where the operator is at the beginning of the string
-	trimmedInput := strings.TrimSpace(input)
-	lowerInput := strings.ToLower(trimmedInput)
-	lowerOp := strings.ToLower(op)
-
-	if strings.HasPrefix(lowerInput, lowerOp) {
-		// Check if it's a standalone word (followed by space or end of string)
-		opLength := len(op)
-		if len(trimmedInput) == opLength || (len(trimmedInput) > opLength && trimmedInput[opLength] == ' ') {
-			afterOp := strings.TrimSpace(trimmedInput[opLength:])
-			if afterOp != "" {
-				return []string{"", afterOp}
-			}
-		}
-	}
-
-	// Original logic for operators in the middle
-	re := regexp.MustCompile(fmt.Sprintf(`(?i)\s+%s\s+`, op))
-	parts := re.Split(input, -1)
-	if len(parts) > 1 {
-		return parts
-	}
-
-	return nil
+// advance moves to the next token
+func (p *Parser) advance() {
+	p.current = p.peek
+	p.peek = p.lexer.NextToken()
 }
 
-func (p *Parser) createImplicitNode(term string) (*Node, error) {
-	slog.Debug(fmt.Sprintf(`Handling implicit: %s`, term))
-	term = strings.Trim(term, `"`)
+// parseExpressionWithDepth parses with depth tracking
+func (p *Parser) parseExpressionWithDepth(depth int) (*EnhancedNode, error) {
+	// Security: Check nesting depth (OWASP A04: DoS prevention)
+	if depth > p.MaxDepth {
+		return nil, fmt.Errorf("query nesting too deep: depth %d exceeds maximum of %d", depth, p.MaxDepth)
+	}
+	return p.parseOrWithDepth(depth)
+}
 
-	containsWildcard := strings.Contains(term, "*") || strings.Contains(term, "?")
-
-	node := &Node{
-		Type:     NodeLogical,
-		Operator: OR,
+// parseOrWithDepth handles OR operations with depth tracking
+func (p *Parser) parseOrWithDepth(depth int) (*EnhancedNode, error) {
+	left, err := p.parseAndWithDepth(depth + 1)
+	if err != nil {
+		return nil, err
 	}
 
-	for _, field := range p.DefaultFields {
-		var child *Node
-		var err error
-
-		if containsWildcard {
-			child, err = p.createWildcardNode(field.Name, term)
-		} else {
-			child, err = p.createTermNode(field.Name, term)
-
-			if child.Type == NodeTerm {
-				child.Type = NodeWildcard
-				child.MatchType = matchContains
-			}
-		}
+	for p.current.Type == TokenOR {
+		p.advance()
+		right, err := p.parseAndWithDepth(depth + 1)
 		if err != nil {
 			return nil, err
 		}
-		node.Children = append(node.Children, child)
+
+		// Convert enhanced nodes to proper nodes before combining
+		leftNode := p.enhancedNodeToNode(left)
+		rightNode := p.enhancedNodeToNode(right)
+
+		left = &EnhancedNode{
+			Node: &Node{
+				Type:     NodeLogical,
+				Operator: OR,
+				Children: []*Node{leftNode, rightNode},
+			},
+		}
 	}
 
-	return node, nil
+	return left, nil
 }
 
-func (p *Parser) createWildcardNode(field, value string) (*Node, error) {
+// parseAndWithDepth handles AND operations with depth tracking
+func (p *Parser) parseAndWithDepth(depth int) (*EnhancedNode, error) {
+	left, err := p.parseUnaryWithDepth(depth + 1)
+	if err != nil {
+		return nil, err
+	}
+
+	for p.current.Type == TokenAND || p.isImplicitAnd() {
+		if p.current.Type == TokenAND {
+			p.advance()
+		}
+		// Implicit AND: if we see another term without an operator
+		right, err := p.parseUnaryWithDepth(depth + 1)
+		if err != nil {
+			return nil, err
+		}
+
+		// Convert enhanced nodes to proper nodes before combining
+		leftNode := p.enhancedNodeToNode(left)
+		rightNode := p.enhancedNodeToNode(right)
+
+		left = &EnhancedNode{
+			Node: &Node{
+				Type:     NodeLogical,
+				Operator: AND,
+				Children: []*Node{leftNode, rightNode},
+			},
+		}
+	}
+
+	return left, nil
+}
+
+// isImplicitAnd checks if we should treat the next token as an implicit AND
+func (p *Parser) isImplicitAnd() bool {
+	// If we see a new term start without an operator, it's implicit AND
+	switch p.current.Type {
+	case TokenIdent, TokenString, TokenPlus, TokenMinus, TokenNOT, TokenLParen:
+		return true
+	}
+	return false
+}
+
+// parseUnaryWithDepth handles unary operations with depth tracking
+func (p *Parser) parseUnaryWithDepth(depth int) (*EnhancedNode, error) {
+	// Handle NOT
+	if p.current.Type == TokenNOT {
+		p.advance()
+		expr, err := p.parsePrimaryWithDepth(depth + 1)
+		if err != nil {
+			return nil, err
+		}
+
+		return &EnhancedNode{
+			Node: &Node{
+				Type:     NodeLogical,
+				Operator: NOT,
+				Children: []*Node{expr.Node},
+			},
+		}, nil
+	}
+
+	// Handle required (+)
+	if p.current.Type == TokenPlus {
+		p.advance()
+		expr, err := p.parsePrimaryWithDepth(depth + 1)
+		if err != nil {
+			return nil, err
+		}
+		expr.Required = true
+		return expr, nil
+	}
+
+	// Handle prohibited (-)
+	if p.current.Type == TokenMinus {
+		p.advance()
+		expr, err := p.parsePrimaryWithDepth(depth + 1)
+		if err != nil {
+			return nil, err
+		}
+		expr.Prohibited = true
+		return expr, nil
+	}
+
+	return p.parsePrimaryWithDepth(depth + 1)
+}
+
+// parsePrimaryWithDepth handles primary expressions with depth tracking
+func (p *Parser) parsePrimaryWithDepth(depth int) (*EnhancedNode, error) {
+	// Handle grouped expressions
+	if p.current.Type == TokenLParen {
+		p.advance()
+		expr, err := p.parseExpressionWithDepth(depth + 1)
+		if err != nil {
+			return nil, err
+		}
+		if p.current.Type != TokenRParen {
+			return nil, fmt.Errorf("expected ')', got %v", p.current.Value)
+		}
+		p.advance()
+		return expr, nil
+	}
+
+	// Handle quoted phrases
+	if p.current.Type == TokenString {
+		return p.parsePhrase()
+	}
+
+	// Handle field:value or implicit search
+	return p.parseTerm()
+}
+
+// parsePhrase handles quoted phrase searches
+func (p *Parser) parsePhrase() (*EnhancedNode, error) {
 	// Security: Check term count (OWASP A04: DoS prevention)
 	p.termCount++
 	if p.termCount > p.MaxTerms {
 		return nil, fmt.Errorf("too many terms: %d exceeds maximum of %d", p.termCount, p.MaxTerms)
 	}
 
-	// Skip empty fields or values
-	field = strings.TrimSpace(field)
-	value = strings.TrimSpace(value)
+	phrase := p.current.Value
+	p.advance()
 
-	if field == "" || value == "" {
-		return nil, nil
+	// Check for proximity (~n)
+	proximity := 0
+	if p.current.Type == TokenTilde {
+		p.advance()
+		if p.current.Type == TokenNumber {
+			fmt.Sscanf(p.current.Value, "%d", &proximity)
+			p.advance()
+		}
 	}
 
-	formattedField := p.formatFieldName(field)
-
-	node := &Node{
-		Type:  NodeWildcard,
-		Field: formattedField,
-		Value: value,
+	// Check for boost (^n)
+	boost := 0.0
+	if p.current.Type == TokenCaret {
+		p.advance()
+		if p.current.Type == TokenNumber {
+			fmt.Sscanf(p.current.Value, "%f", &boost)
+			p.advance()
+		}
 	}
 
-	// Process the wildcard pattern
-	if strings.HasPrefix(value, "*") && strings.HasSuffix(value, "*") {
-		// For *term* pattern
-		node.MatchType = matchContains
-		node.Value = strings.Trim(value, "*")
-	} else if strings.HasPrefix(value, "*") {
-		// For *term pattern
-		node.MatchType = matchEndsWith
-		node.Value = strings.TrimPrefix(value, "*")
-	} else if strings.HasSuffix(value, "*") {
-		// For term* pattern
-		node.MatchType = matchStartsWith
-		node.Value = strings.TrimSuffix(value, "*")
-	} else if strings.Contains(value, "*") {
-		// For patterns like te*rm
-		node.MatchType = matchContains
-		// Replace wildcards with % for SQL LIKE
-		node.Value = strings.ReplaceAll(value, "*", "%")
-	} else {
-		// Default to contains match for other patterns
-		node.MatchType = matchContains
-	}
-
-	// Skip if the value becomes empty after processing
-	if node.Value == "" {
-		return nil, nil
+	// For now, treat phrase as a term with the full phrase value
+	// In SQL, this will be handled as a LIKE or exact match
+	node := &EnhancedNode{
+		Node: &Node{
+			Type:  NodeTerm,
+			Value: phrase,
+		},
+		IsPhrase:  true,
+		Proximity: proximity,
+		Boost:     boost,
 	}
 
 	return node, nil
+}
+
+// parseTerm handles field:value terms and ranges
+func (p *Parser) parseTerm() (*EnhancedNode, error) {
+	// Check for range query [min TO max] or {min TO max}
+	if p.current.Type == TokenLBracket || p.current.Type == TokenLBrace {
+		return p.parseRange("")
+	}
+
+	// Get the field or value
+	if p.current.Type != TokenIdent && p.current.Type != TokenNumber {
+		return nil, fmt.Errorf("expected identifier or number, got %v", p.current.Value)
+	}
+
+	fieldOrValue := p.current.Value
+	p.advance()
+
+	// Check if this is a field:value pair
+	if p.current.Type == TokenColon {
+		p.advance()
+
+		// Check for range after colon
+		if p.current.Type == TokenLBracket || p.current.Type == TokenLBrace {
+			return p.parseRange(fieldOrValue)
+		}
+
+		// Check for quoted phrase after colon
+		if p.current.Type == TokenString {
+			// Security: Check term count (OWASP A04: DoS prevention)
+			p.termCount++
+			if p.termCount > p.MaxTerms {
+				return nil, fmt.Errorf("too many terms: %d exceeds maximum of %d", p.termCount, p.MaxTerms)
+			}
+
+			phrase := p.current.Value
+			p.advance()
+
+			// Check for proximity
+			proximity := 0
+			if p.current.Type == TokenTilde {
+				p.advance()
+				if p.current.Type == TokenNumber {
+					fmt.Sscanf(p.current.Value, "%d", &proximity)
+					p.advance()
+				}
+			}
+
+			// Check for boost
+			boost := 0.0
+			if p.current.Type == TokenCaret {
+				p.advance()
+				if p.current.Type == TokenNumber {
+					fmt.Sscanf(p.current.Value, "%f", &boost)
+					p.advance()
+				}
+			}
+
+			formattedField := p.formatFieldName(fieldOrValue)
+			node := &EnhancedNode{
+				Node: &Node{
+					Type:  NodeTerm,
+					Field: formattedField,
+					Value: phrase,
+				},
+				IsPhrase:  true,
+				Proximity: proximity,
+				Boost:     boost,
+			}
+			return node, nil
+		}
+
+		// Regular field:value (or wildcard value)
+		if p.current.Type != TokenIdent && p.current.Type != TokenNumber && p.current.Type != TokenWildcard {
+			return nil, fmt.Errorf("expected value after ':', got %v", p.current.Value)
+		}
+
+		// Security: Check term count (OWASP A04: DoS prevention)
+		p.termCount++
+		if p.termCount > p.MaxTerms {
+			return nil, fmt.Errorf("too many terms: %d exceeds maximum of %d", p.termCount, p.MaxTerms)
+		}
+
+		// Build the value, potentially including wildcards
+		var value string
+		if p.current.Type == TokenWildcard {
+			value = p.current.Value
+			p.advance()
+			// Continue building the value if there's more
+			for p.current.Type == TokenIdent || p.current.Type == TokenWildcard {
+				value += p.current.Value
+				p.advance()
+			}
+		} else {
+			value = p.current.Value
+			p.advance()
+		}
+
+		// Check for fuzzy (~n)
+		fuzzy := 0
+		if p.current.Type == TokenTilde {
+			p.advance()
+			if p.current.Type == TokenNumber {
+				fmt.Sscanf(p.current.Value, "%d", &fuzzy)
+				p.advance()
+			} else {
+				fuzzy = 2 // Default fuzzy distance
+			}
+		}
+
+		// Check for boost (^n)
+		boost := 0.0
+		if p.current.Type == TokenCaret {
+			p.advance()
+			if p.current.Type == TokenNumber {
+				fmt.Sscanf(p.current.Value, "%f", &boost)
+				p.advance()
+			}
+		}
+
+		formattedField := p.formatFieldName(fieldOrValue)
+
+		// Determine if this is a wildcard query
+		nodeType := NodeTerm
+		matchType := matchExact
+		processedValue := value
+
+		if strings.Contains(value, "*") || strings.Contains(value, "?") {
+			nodeType = NodeWildcard
+			if strings.HasPrefix(value, "*") && strings.HasSuffix(value, "*") {
+				matchType = matchContains
+				processedValue = strings.Trim(value, "*")
+			} else if strings.HasPrefix(value, "*") {
+				matchType = matchEndsWith
+				processedValue = strings.TrimPrefix(value, "*")
+			} else if strings.HasSuffix(value, "*") {
+				matchType = matchStartsWith
+				processedValue = strings.TrimSuffix(value, "*")
+			} else {
+				matchType = matchContains
+				processedValue = strings.ReplaceAll(strings.ReplaceAll(value, "*", "%"), "?", "_")
+			}
+		}
+
+		node := &EnhancedNode{
+			Node: &Node{
+				Type:      nodeType,
+				Field:     formattedField,
+				Value:     processedValue,
+				MatchType: matchType,
+			},
+			Fuzzy: fuzzy,
+			Boost: boost,
+		}
+
+		return node, nil
+	}
+
+	// No colon, so this is an implicit search
+	return p.createImplicitSearch(fieldOrValue)
+}
+
+// parseRange handles range queries [min TO max] or {min TO max}
+func (p *Parser) parseRange(field string) (*EnhancedNode, error) {
+	// Security: Check term count (OWASP A04: DoS prevention)
+	// Range queries count as terms (they expand to comparison operations)
+	p.termCount++
+	if p.termCount > p.MaxTerms {
+		return nil, fmt.Errorf("too many terms: %d exceeds maximum of %d", p.termCount, p.MaxTerms)
+	}
+
+	inclusive := p.current.Type == TokenLBracket
+	p.advance()
+
+	// Get min value
+	if p.current.Type != TokenIdent && p.current.Type != TokenNumber && p.current.Value != "*" {
+		return nil, fmt.Errorf("expected min value in range, got %v", p.current.Value)
+	}
+	min := p.current.Value
+	p.advance()
+
+	// Expect TO
+	if p.current.Type != TokenTO {
+		return nil, fmt.Errorf("expected TO in range query, got %v", p.current.Value)
+	}
+	p.advance()
+
+	// Get max value
+	if p.current.Type != TokenIdent && p.current.Type != TokenNumber && p.current.Value != "*" {
+		return nil, fmt.Errorf("expected max value in range, got %v", p.current.Value)
+	}
+	max := p.current.Value
+	p.advance()
+
+	// Expect closing bracket/brace
+	expectedClose := TokenRBracket
+	if !inclusive {
+		expectedClose = TokenRBrace
+	}
+	if p.current.Type != expectedClose {
+		return nil, fmt.Errorf("expected closing bracket/brace in range")
+	}
+	p.advance()
+
+	// Check for boost
+	boost := 0.0
+	if p.current.Type == TokenCaret {
+		p.advance()
+		if p.current.Type == TokenNumber {
+			fmt.Sscanf(p.current.Value, "%f", &boost)
+			p.advance()
+		}
+	}
+
+	formattedField := field
+	if field != "" {
+		formattedField = p.formatFieldName(field)
+	}
+
+	node := &EnhancedNode{
+		Node: &Node{
+			Type:  NodeTerm, // Use NodeTerm as placeholder, actual handling via RangeInfo
+			Field: formattedField,
+		},
+		RangeInfo: &RangeNode{
+			Field:     formattedField,
+			Min:       min,
+			Max:       max,
+			Inclusive: inclusive,
+		},
+		Boost: boost,
+	}
+
+	return node, nil
+}
+
+// createImplicitSearch creates an OR query across default fields
+func (p *Parser) createImplicitSearch(term string) (*EnhancedNode, error) {
+	slog.Debug(fmt.Sprintf(`Handling implicit search: %s`, term))
+
+	if len(p.DefaultFields) == 0 {
+		return nil, fmt.Errorf("no default fields for implicit search")
+	}
+
+	// Create OR node with children for each default field
+	var children []*Node
+	for _, field := range p.DefaultFields {
+		// Security: Check term count (OWASP A04: DoS prevention)
+		// Each default field counts as a term in implicit search
+		p.termCount++
+		if p.termCount > p.MaxTerms {
+			return nil, fmt.Errorf("too many terms: %d exceeds maximum of %d", p.termCount, p.MaxTerms)
+		}
+
+		formattedField := p.formatFieldName(field.Name)
+
+		// Determine if wildcard
+		nodeType := NodeTerm
+		matchType := matchContains // Default to contains for implicit search
+		processedValue := term
+
+		if strings.Contains(term, "*") || strings.Contains(term, "?") {
+			nodeType = NodeWildcard
+			if strings.HasPrefix(term, "*") && strings.HasSuffix(term, "*") {
+				matchType = matchContains
+				processedValue = strings.Trim(term, "*")
+			} else if strings.HasPrefix(term, "*") {
+				matchType = matchEndsWith
+				processedValue = strings.TrimPrefix(term, "*")
+			} else if strings.HasSuffix(term, "*") {
+				matchType = matchStartsWith
+				processedValue = strings.TrimSuffix(term, "*")
+			} else {
+				matchType = matchContains
+				processedValue = strings.ReplaceAll(strings.ReplaceAll(term, "*", "%"), "?", "_")
+			}
+		} else {
+			nodeType = NodeWildcard // Use wildcard with contains for implicit
+		}
+
+		children = append(children, &Node{
+			Type:      nodeType,
+			Field:     formattedField,
+			Value:     processedValue,
+			MatchType: matchType,
+		})
+	}
+
+	node := &EnhancedNode{
+		Node: &Node{
+			Type:     NodeLogical,
+			Operator: OR,
+			Children: children,
+		},
+	}
+
+	return node, nil
+}
+
+// enhancedNodeToNode converts an EnhancedNode to a plain Node, applying all enhancements
+func (p *Parser) enhancedNodeToNode(enode *EnhancedNode) *Node {
+	if enode == nil || enode.Node == nil {
+		return nil
+	}
+
+	node := enode.Node
+
+	// Handle range queries - convert to logical AND node with comparison nodes
+	if enode.RangeInfo != nil {
+		var children []*Node
+
+		// Add min condition
+		if enode.RangeInfo.Min != "*" {
+			op := OpGreaterThanOrEqual
+			if !enode.RangeInfo.Inclusive {
+				op = OpGreaterThan
+			}
+			children = append(children, &Node{
+				Type:       NodeTerm,
+				Field:      enode.RangeInfo.Field,
+				Value:      enode.RangeInfo.Min,
+				Comparison: op,
+			})
+		}
+
+		// Add max condition
+		if enode.RangeInfo.Max != "*" {
+			op := OpLessThanOrEqual
+			if !enode.RangeInfo.Inclusive {
+				op = OpLessThan
+			}
+			children = append(children, &Node{
+				Type:       NodeTerm,
+				Field:      enode.RangeInfo.Field,
+				Value:      enode.RangeInfo.Max,
+				Comparison: op,
+			})
+		}
+
+		if len(children) == 0 {
+			// No conditions, return empty node
+			return nil
+		} else if len(children) == 1 {
+			node = children[0]
+		} else {
+			node = &Node{
+				Type:     NodeLogical,
+				Operator: AND,
+				Children: children,
+			}
+		}
+	}
+
+	// Handle prohibited - wrap in NOT
+	if enode.Prohibited {
+		node = &Node{
+			Type:     NodeLogical,
+			Operator: NOT,
+			Children: []*Node{node},
+		}
+	}
+
+	// Fuzzy is already handled in the node conversion
+	// Boost is ignored (no SQL support)
+	// Required doesn't need special handling (implicit in AND)
+
+	return node
 }
 
 func (p *Parser) formatFieldName(fieldName string) string {
@@ -379,125 +810,115 @@ func (p *Parser) formatFieldName(fieldName string) string {
 	return fieldName
 }
 
-func (p *Parser) createTermNode(field, value string) (*Node, error) {
-	// Security: Check term count (OWASP A04: DoS prevention)
-	p.termCount++
-	if p.termCount > p.MaxTerms {
-		return nil, fmt.Errorf("too many terms: %d exceeds maximum of %d", p.termCount, p.MaxTerms)
-	}
+// Helper conversion methods
 
-	field = strings.TrimSpace(field)
-	value = strings.TrimSpace(value)
-
-	if field == "" || value == "" {
-		return nil, nil
-	}
-	formattedField := p.formatFieldName(field)
-
-	trimmedValue := strings.TrimSpace(strings.Trim(value, `"`))
-
-	// Skip if the value becomes empty after trimming
-	if trimmedValue == "" {
-		return nil, nil
-	}
-
-	node := &Node{
-		Type:  NodeTerm,
-		Field: formattedField,
-		Value: strings.Trim(value, `"`),
-	}
-
-	if strings.Contains(value, "*") || strings.Contains(value, "?") {
-		node.Type = NodeWildcard
-
-		// Determine the match type based on wildcard position
-		if strings.HasPrefix(value, "*") && strings.HasSuffix(value, "*") {
-			node.MatchType = matchContains
-			node.Value = strings.Trim(value, "*")
-		} else if strings.HasPrefix(value, "*") {
-			node.MatchType = matchEndsWith
-			node.Value = strings.TrimPrefix(value, "*")
-		} else if strings.HasSuffix(value, "*") {
-			node.MatchType = matchStartsWith
-			node.Value = strings.TrimSuffix(value, "*")
-		} else {
-			// For patterns like te*rm or te?rm
-			node.MatchType = matchContains
-			// For SQL LIKE, convert * to % and ? to _
-			node.Value = strings.ReplaceAll(strings.ReplaceAll(value, "*", "%"), "?", "_")
-		}
-
-		// Skip if the value becomes empty after processing wildcards
-		if node.Value == "" {
-			return nil, nil
-		}
-	}
-
-	return node, nil
-}
-
-func (p *Parser) createLogicalNodeWithDepth(op LogicalOperator, parts []string, depth int) (*Node, error) {
-	node := &Node{
-		Type:     NodeLogical,
-		Operator: op,
-	}
-
-	for _, part := range parts {
-		if strings.TrimSpace(part) == "" {
-			continue
-		}
-		child, err := p.parseWithDepth(part, depth+1)
-		if err != nil {
-			return nil, err
-		}
-		if child != nil {
-			node.Children = append(node.Children, child)
-		}
-	}
-
-	// If no valid children were found, return nil
-	if len(node.Children) == 0 {
-		return nil, nil
-	}
-
-	return node, nil
-}
-
-func (p *Parser) nodeToMap(node *Node) map[string]any {
-	if node == nil {
+func (p *Parser) enhancedNodeToMap(node *EnhancedNode) map[string]any {
+	if node == nil || node.Node == nil {
 		return nil
 	}
 
-	switch node.Type {
+	var result map[string]any
+	
+	// Convert base node to map
+	switch node.Node.Type {
 	case NodeTerm:
-		return map[string]any{node.Field: node.Value}
+		result = map[string]any{node.Node.Field: node.Node.Value}
 	case NodeWildcard:
-		return map[string]any{node.Field: map[string]string{
-			"$like": wildcardToPattern(node.Value, node.MatchType),
+		result = map[string]any{node.Node.Field: map[string]string{
+			"$like": wildcardToPattern(node.Node.Value, node.Node.MatchType),
 		}}
 	case NodeLogical:
-		result := make(map[string]any)
-		children := make([]map[string]any, 0, len(node.Children))
-		for _, child := range node.Children {
-			children = append(children, p.nodeToMap(child))
+		result = make(map[string]any)
+		children := make([]map[string]any, 0, len(node.Node.Children))
+		for _, child := range node.Node.Children {
+			// Convert plain node to enhanced node for recursive processing
+			enhancedChild := &EnhancedNode{Node: child}
+			children = append(children, p.enhancedNodeToMap(enhancedChild))
 		}
-		result[string(node.Operator)] = children
-		return result
+		result[string(node.Node.Operator)] = children
+	default:
+		result = make(map[string]any)
 	}
-	return nil
+
+	// Add enhanced fields
+	if node.Required {
+		result["$required"] = true
+	}
+	if node.Prohibited {
+		result["$prohibited"] = true
+	}
+	if node.Boost > 0 {
+		result["$boost"] = node.Boost
+	}
+	if node.Proximity > 0 {
+		result["$proximity"] = node.Proximity
+	}
+	if node.Fuzzy > 0 {
+		result["$fuzzy"] = node.Fuzzy
+	}
+	if node.RangeInfo != nil {
+		result["$range"] = map[string]any{
+			"min":       node.RangeInfo.Min,
+			"max":       node.RangeInfo.Max,
+			"inclusive": node.RangeInfo.Inclusive,
+		}
+	}
+
+	return result
 }
 
-func (p *Parser) nodeToSQL(node *Node) (string, []any, error) {
+func (p *Parser) enhancedNodeToSQL(node *EnhancedNode) (string, []any, error) {
+	if node == nil || node.Node == nil {
+		return "", nil, nil
+	}
+
+	// Handle range queries
+	if node.RangeInfo != nil {
+		return p.rangeToSQL(node.RangeInfo)
+	}
+
+	// Handle prohibited (NOT)
+	if node.Prohibited {
+		sql, params, err := p.enhancedNodeToSQLInternal(node.Node)
+		if err != nil {
+			return "", nil, err
+		}
+		return fmt.Sprintf("NOT (%s)", sql), params, nil
+	}
+
+	// For required, just process normally (required is implicit in AND)
+	// For boost, ignore in SQL (no relevance scoring)
+	// For fuzzy, approximate with LIKE wildcards
+	if node.Fuzzy > 0 && node.Node.Type == NodeTerm {
+		// Convert fuzzy to wildcard search
+		node.Node.Type = NodeWildcard
+		node.Node.MatchType = matchContains
+	}
+
+	// For proximity searches, treat as phrase match (best effort)
+	// SQL doesn't have native proximity, so we'll just do exact match
+
+	return p.enhancedNodeToSQLInternal(node.Node)
+}
+
+// enhancedNodeToSQLInternal converts a node to SQL (internal helper)
+func (p *Parser) enhancedNodeToSQLInternal(node *Node) (string, []any, error) {
 	if node == nil {
 		return "", nil, nil
 	}
 
 	switch node.Type {
 	case NodeTerm:
-		if strings.Contains(node.Field, "->>") {
-			return fmt.Sprintf("%s = ?", node.Field), []any{node.Value}, nil
+		// Use comparison operator if specified, otherwise default to =
+		op := string(node.Comparison)
+		if op == "" {
+			op = "="
 		}
-		return fmt.Sprintf("%s = ?", node.Field), []any{node.Value}, nil
+
+		if strings.Contains(node.Field, "->>") {
+			return fmt.Sprintf("%s %s ?", node.Field, op), []any{node.Value}, nil
+		}
+		return fmt.Sprintf("%s %s ?", node.Field, op), []any{node.Value}, nil
 	case NodeWildcard:
 		pattern := wildcardToPattern(node.Value, node.MatchType)
 		if strings.Contains(node.Field, "->>") {
@@ -510,7 +931,7 @@ func (p *Parser) nodeToSQL(node *Node) (string, []any, error) {
 		var params []any
 
 		for _, child := range node.Children {
-			sqlPart, childParams, err := p.nodeToSQL(child)
+			sqlPart, childParams, err := p.enhancedNodeToSQLInternal(child)
 			if err != nil {
 				return "", nil, err
 			}
@@ -522,6 +943,19 @@ func (p *Parser) nodeToSQL(node *Node) (string, []any, error) {
 
 		if len(parts) == 0 {
 			return "", nil, nil
+		}
+
+		// Special handling for NOT operator - always wrap in NOT(...) even with single child
+		if node.Operator == NOT {
+			if len(parts) == 1 {
+				return fmt.Sprintf("NOT (%s)", parts[0]), params, nil
+			}
+			// NOT with multiple children - wrap each in NOT and AND them
+			notParts := make([]string, len(parts))
+			for i, part := range parts {
+				notParts[i] = fmt.Sprintf("NOT (%s)", part)
+			}
+			return fmt.Sprintf("(%s)", strings.Join(notParts, " AND ")), params, nil
 		}
 
 		if len(parts) == 1 {
@@ -536,42 +970,86 @@ func (p *Parser) nodeToSQL(node *Node) (string, []any, error) {
 		return fmt.Sprintf("(%s)", strings.Join(parts, fmt.Sprintf(" %s ", operator))), params, nil
 	}
 
-	return "", nil, fmt.Errorf("unsupported node type")
+	return "", nil, fmt.Errorf("unsupported node type: %v", node.Type)
 }
 
-func (p *Parser) ParseToDynamoDBPartiQL(query string) (string, []types.AttributeValue, error) {
-	slog.Debug(fmt.Sprintf(`Parsing query to DynamoDB PartiQL: %s`, query))
-
-	// Security: Validate query length (OWASP A04: DoS prevention)
-	if len(query) > p.MaxQueryLength {
-		return "", nil, fmt.Errorf("query too long: %d bytes exceeds maximum of %d bytes", len(query), p.MaxQueryLength)
+func (p *Parser) rangeToSQL(rangeInfo *RangeNode) (string, []any, error) {
+	if rangeInfo == nil {
+		return "", nil, nil
 	}
 
-	// Reset term counter for this parse
-	p.termCount = 0
+	var conditions []string
+	var params []any
 
-	// Try enhanced parser first for full Lucene syntax support
-	if ep := p.tryEnhancedParser(query); ep != nil {
-		return ep.ParseToDynamoDBPartiQL(query)
+	// Handle min value
+	if rangeInfo.Min != "*" {
+		if rangeInfo.Inclusive {
+			conditions = append(conditions, fmt.Sprintf("%s >= ?", rangeInfo.Field))
+		} else {
+			conditions = append(conditions, fmt.Sprintf("%s > ?", rangeInfo.Field))
+		}
+		params = append(params, rangeInfo.Min)
 	}
 
-	// Fallback to legacy parser
-	node, err := p.parseWithDepth(query, 0)
-	if err != nil {
-		return "", nil, err
+	// Handle max value
+	if rangeInfo.Max != "*" {
+		if rangeInfo.Inclusive {
+			conditions = append(conditions, fmt.Sprintf("%s <= ?", rangeInfo.Field))
+		} else {
+			conditions = append(conditions, fmt.Sprintf("%s < ?", rangeInfo.Field))
+		}
+		params = append(params, rangeInfo.Max)
 	}
-	return p.nodeToDynamoDBPartiQL(node)
+
+	if len(conditions) == 0 {
+		return "", nil, nil
+	}
+
+	return strings.Join(conditions, " AND "), params, nil
 }
 
-func (p *Parser) nodeToDynamoDBPartiQL(node *Node) (string, []types.AttributeValue, error) {
+func (p *Parser) enhancedNodeToDynamoDBPartiQL(node *EnhancedNode) (string, []types.AttributeValue, error) {
+	if node == nil || node.Node == nil {
+		return "", nil, nil
+	}
+
+	// Handle range queries
+	if node.RangeInfo != nil {
+		return p.rangeToDynamoDBPartiQL(node.RangeInfo)
+	}
+
+	// Handle prohibited (NOT)
+	if node.Prohibited {
+		sql, params, err := p.enhancedNodeToDynamoDBPartiQLInternal(node.Node)
+		if err != nil {
+			return "", nil, err
+		}
+		return fmt.Sprintf("NOT (%s)", sql), params, nil
+	}
+
+	// For fuzzy, approximate with contains
+	if node.Fuzzy > 0 && node.Node.Type == NodeTerm {
+		node.Node.Type = NodeWildcard
+		node.Node.MatchType = matchContains
+	}
+
+	return p.enhancedNodeToDynamoDBPartiQLInternal(node.Node)
+}
+
+// enhancedNodeToDynamoDBPartiQLInternal converts a node to DynamoDB PartiQL (internal helper)
+func (p *Parser) enhancedNodeToDynamoDBPartiQLInternal(node *Node) (string, []types.AttributeValue, error) {
 	if node == nil {
 		return "", nil, nil
 	}
 
 	switch node.Type {
 	case NodeTerm:
-		// For term node, create an exact match condition
-		return fmt.Sprintf("%s = ?", node.Field), []types.AttributeValue{
+		// Use comparison operator if specified, otherwise default to =
+		op := string(node.Comparison)
+		if op == "" {
+			op = "="
+		}
+		return fmt.Sprintf("%s %s ?", node.Field, op), []types.AttributeValue{
 			&types.AttributeValueMemberS{Value: node.Value},
 		}, nil
 	case NodeWildcard:
@@ -596,7 +1074,7 @@ func (p *Parser) nodeToDynamoDBPartiQL(node *Node) (string, []types.AttributeVal
 		var params []types.AttributeValue
 
 		for _, child := range node.Children {
-			part, childParams, err := p.nodeToDynamoDBPartiQL(child)
+			part, childParams, err := p.enhancedNodeToDynamoDBPartiQLInternal(child)
 			if err != nil {
 				return "", nil, err
 			}
@@ -610,6 +1088,23 @@ func (p *Parser) nodeToDynamoDBPartiQL(node *Node) (string, []types.AttributeVal
 			return "", nil, nil
 		}
 
+		// Special handling for NOT operator - always wrap in NOT(...) even with single child
+		if node.Operator == NOT {
+			if len(parts) == 1 {
+				return fmt.Sprintf("NOT (%s)", parts[0]), params, nil
+			}
+			// NOT with multiple children - wrap each in NOT and AND them
+			notParts := make([]string, len(parts))
+			for i, part := range parts {
+				notParts[i] = fmt.Sprintf("NOT (%s)", part)
+			}
+			return fmt.Sprintf("(%s)", strings.Join(notParts, " AND ")), params, nil
+		}
+
+		if len(parts) == 1 {
+			return parts[0], params, nil
+		}
+
 		operator := string(node.Operator)
 		if node.Negate {
 			operator = "NOT " + operator
@@ -618,7 +1113,42 @@ func (p *Parser) nodeToDynamoDBPartiQL(node *Node) (string, []types.AttributeVal
 		return fmt.Sprintf("(%s)", strings.Join(parts, fmt.Sprintf(" %s ", operator))), params, nil
 	}
 
-	return "", nil, fmt.Errorf("unsupported node type")
+	return "", nil, fmt.Errorf("unsupported node type: %v", node.Type)
+}
+
+func (p *Parser) rangeToDynamoDBPartiQL(rangeInfo *RangeNode) (string, []types.AttributeValue, error) {
+	if rangeInfo == nil {
+		return "", nil, nil
+	}
+
+	var conditions []string
+	var params []types.AttributeValue
+
+	// Handle min value
+	if rangeInfo.Min != "*" {
+		if rangeInfo.Inclusive {
+			conditions = append(conditions, fmt.Sprintf("%s >= ?", rangeInfo.Field))
+		} else {
+			conditions = append(conditions, fmt.Sprintf("%s > ?", rangeInfo.Field))
+		}
+		params = append(params, &types.AttributeValueMemberS{Value: rangeInfo.Min})
+	}
+
+	// Handle max value
+	if rangeInfo.Max != "*" {
+		if rangeInfo.Inclusive {
+			conditions = append(conditions, fmt.Sprintf("%s <= ?", rangeInfo.Field))
+		} else {
+			conditions = append(conditions, fmt.Sprintf("%s < ?", rangeInfo.Field))
+		}
+		params = append(params, &types.AttributeValueMemberS{Value: rangeInfo.Max})
+	}
+
+	if len(conditions) == 0 {
+		return "", nil, nil
+	}
+
+	return strings.Join(conditions, " AND "), params, nil
 }
 
 func wildcardToPattern(value string, matchType MatchType) string {
