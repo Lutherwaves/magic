@@ -9,6 +9,11 @@ import (
 	"github.com/grindlemire/go-lucene/pkg/lucene/expr"
 )
 
+// Security (OWASP Top 10 Compliance):
+// - A03 Injection: All queries use parameterized statements (? placeholders → $N)
+//   preventing SQL injection attacks
+// - A04 Insecure Design: DoS protection via query length limits (see parser.go)
+
 // PostgresJSONBDriver is a custom PostgreSQL driver that supports JSONB field notation.
 // It extends the base PostgreSQL driver to handle field->>'subfield' syntax.
 type PostgresJSONBDriver struct {
@@ -23,22 +28,24 @@ func NewPostgresJSONBDriver(fields []FieldInfo) *PostgresJSONBDriver {
 		fieldMap[f.Name] = f
 	}
 
+	// RenderFNs map - we handle most operators in renderParamInternal
+	// Only keeping base implementations for operators we don't intercept
 	fns := map[expr.Operator]driver.RenderFN{
 		expr.Literal:   driver.Shared[expr.Literal],
 		expr.And:       driver.Shared[expr.And],
 		expr.Or:        driver.Shared[expr.Or],
 		expr.Not:       driver.Shared[expr.Not],
-		expr.Equals:    customPostgresEquals,    // Custom to handle JSONB syntax
-		expr.Range:     driver.Shared[expr.Range], // Handled in renderParamInternal
+		expr.Equals:    driver.Shared[expr.Equals],
+		expr.Range:     driver.Shared[expr.Range],
 		expr.Must:      driver.Shared[expr.Must],
 		expr.MustNot:   driver.Shared[expr.MustNot],
-		expr.Wild:      customPostgresWild,      // Custom to use ILIKE instead of SIMILAR TO
+		expr.Wild:      driver.Shared[expr.Wild],
 		expr.Regexp:    driver.Shared[expr.Regexp],
-		expr.Like:      customPostgresLike,      // Custom LIKE to use ILIKE
-		expr.Greater:   customPostgresComparison(">"),
-		expr.GreaterEq: customPostgresComparison(">="),
-		expr.Less:      customPostgresComparison("<"),
-		expr.LessEq:    customPostgresComparison("<="),
+		expr.Like:      driver.Shared[expr.Like],
+		expr.Greater:   driver.Shared[expr.Greater],
+		expr.GreaterEq: driver.Shared[expr.GreaterEq],
+		expr.Less:      driver.Shared[expr.Less],
+		expr.LessEq:    driver.Shared[expr.LessEq],
 		expr.In:        driver.Shared[expr.In],
 		expr.List:      driver.Shared[expr.List],
 	}
@@ -91,7 +98,7 @@ func (p *PostgresJSONBDriver) renderParamInternal(e *expr.Expression) (string, [
 		params := append(leftParams, rightParams...)
 
 		// Check if left contains JSONB syntax
-		if strings.Contains(leftStr, "->>") {
+		if isJSONBSyntax(leftStr) {
 			return fmt.Sprintf("%s ILIKE %s", leftStr, rightStr), params, nil
 		}
 		return fmt.Sprintf("%s::text ILIKE %s", leftStr, rightStr), params, nil
@@ -146,13 +153,13 @@ func (p *PostgresJSONBDriver) serializeColumn(in any) (string, []any, error) {
 	case expr.Column:
 		colStr := string(v)
 		// Don't quote JSONB syntax (contains ->>)
-		if strings.Contains(colStr, "->>") {
+		if isJSONBSyntax(colStr) {
 			return colStr, nil, nil
 		}
 		return fmt.Sprintf(`"%s"`, colStr), nil, nil
 	case string:
 		// Handle string columns (for some operators)
-		if strings.Contains(v, "->>") {
+		if isJSONBSyntax(v) {
 			return v, nil, nil
 		}
 		return fmt.Sprintf(`"%s"`, v), nil, nil
@@ -162,7 +169,7 @@ func (p *PostgresJSONBDriver) serializeColumn(in any) (string, []any, error) {
 			if col, ok := v.Left.(expr.Column); ok {
 				colStr := string(col)
 				// Don't quote JSONB syntax
-				if strings.Contains(colStr, "->>") {
+				if isJSONBSyntax(colStr) {
 					return colStr, nil, nil
 				}
 				return fmt.Sprintf(`"%s"`, colStr), nil, nil
@@ -179,27 +186,17 @@ func (p *PostgresJSONBDriver) serializeColumn(in any) (string, []any, error) {
 func (p *PostgresJSONBDriver) serializeValue(in any) (string, []any, error) {
 	switch v := in.(type) {
 	case string:
-		// Convert Lucene wildcards to SQL wildcards
-		val := strings.ReplaceAll(v, "*", "%")
-		val = strings.ReplaceAll(val, "?", "_")
-		return "?", []any{val}, nil
+		return "?", []any{convertWildcards(v)}, nil
 	case *expr.Expression:
 		// For LITERAL expressions, extract the value and convert wildcards
 		if v.Op == expr.Literal && v.Left != nil {
-			// Extract the literal value
 			literalVal := fmt.Sprintf("%v", v.Left)
-			// Convert wildcards
-			literalVal = strings.ReplaceAll(literalVal, "*", "%")
-			literalVal = strings.ReplaceAll(literalVal, "?", "_")
-			return "?", []any{literalVal}, nil
+			return "?", []any{convertWildcards(literalVal)}, nil
 		}
 		// For WILD expressions, extract the pattern from Left
 		if v.Op == expr.Wild && v.Left != nil {
 			literalVal := fmt.Sprintf("%v", v.Left)
-			// Convert wildcards
-			literalVal = strings.ReplaceAll(literalVal, "*", "%")
-			literalVal = strings.ReplaceAll(literalVal, "?", "_")
-			return "?", []any{literalVal}, nil
+			return "?", []any{convertWildcards(literalVal)}, nil
 		}
 		// For other expression types, this is unexpected in value context
 		return "", nil, fmt.Errorf("unexpected expression type in value position: %v", v.Op)
@@ -256,58 +253,20 @@ func (p *PostgresJSONBDriver) formatFieldName(fieldName string) expr.Column {
 	return expr.Column(fieldName)
 }
 
-// unquoteJSONB removes quotes from JSONB syntax to make it work in PostgreSQL.
-// Converts: "labels->>'key'" to: labels->>'key'
-func unquoteJSONB(col string) string {
-	if strings.Contains(col, "->>") {
-		// Remove only the outermost quotes if they exist
-		if len(col) >= 2 && col[0] == '"' && col[len(col)-1] == '"' {
-			return col[1 : len(col)-1]
-		}
-	}
-	return col
+// Helper functions for DRY and cleaner code
+
+// convertWildcards converts Lucene wildcards to SQL wildcards.
+// * (any characters) → % (SQL wildcard)
+// ? (single character) → _ (SQL wildcard)
+func convertWildcards(s string) string {
+	s = strings.ReplaceAll(s, "*", "%")
+	s = strings.ReplaceAll(s, "?", "_")
+	return s
 }
 
-// customPostgresEquals implements Equals operator with JSONB support.
-func customPostgresEquals(left, right string) (string, error) {
-	left = unquoteJSONB(left)
-	return fmt.Sprintf("%s = %s", left, right), nil
-}
-
-// customPostgresComparison creates comparison operators (>, >=, <, <=) with JSONB support.
-func customPostgresComparison(op string) driver.RenderFN {
-	return func(left, right string) (string, error) {
-		left = unquoteJSONB(left)
-		return fmt.Sprintf("%s %s %s", left, op, right), nil
-	}
-}
-
-// customPostgresLike implements case-insensitive LIKE using ILIKE.
-func customPostgresLike(left, right string) (string, error) {
-	// Unquote JSONB syntax first
-	left = unquoteJSONB(left)
-
-	// Check if it's a regex pattern /.../
-	if len(right) >= 4 && right[1] == '/' && right[len(right)-2] == '/' {
-		return fmt.Sprintf("%s ~ %s", left, right), nil
-	}
-
-	// Replace wildcards
-	right = strings.ReplaceAll(right, "*", "%")
-	right = strings.ReplaceAll(right, "?", "_")
-
-	// Use ILIKE for case-insensitive matching
-	// Also cast field to text if it's not already JSONB syntax
-	if strings.Contains(left, "->>") {
-		return fmt.Sprintf("%s ILIKE %s", left, right), nil
-	}
-	return fmt.Sprintf("%s::text ILIKE %s", left, right), nil
-}
-
-// customPostgresWild implements wildcard matching using ILIKE instead of SIMILAR TO.
-func customPostgresWild(left, right string) (string, error) {
-	// Delegate to LIKE handler which already handles wildcards correctly
-	return customPostgresLike(left, right)
+// isJSONBSyntax checks if a column string contains JSONB accessor syntax.
+func isJSONBSyntax(col string) bool {
+	return strings.Contains(col, "->>")
 }
 
 // extractLiteralValue extracts the literal value from an expression or returns it as-is.
