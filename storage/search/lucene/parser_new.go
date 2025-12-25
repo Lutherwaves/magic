@@ -64,6 +64,14 @@ func NewEnhancedParserFromType(model any) (*EnhancedParser, error) {
 func (ep *EnhancedParser) ParseToSQL(query string) (string, []any, error) {
 	slog.Debug(fmt.Sprintf(`Parsing enhanced query to SQL: %s`, query))
 
+	// Security: Validate query length (OWASP A04: DoS prevention)
+	if len(query) > ep.MaxQueryLength {
+		return "", nil, fmt.Errorf("query too long: %d bytes exceeds maximum of %d bytes", len(query), ep.MaxQueryLength)
+	}
+
+	// Reset term counter for this parse
+	ep.termCount = 0
+
 	node, err := ep.Parse(query)
 	if err != nil {
 		return "", nil, err
@@ -74,6 +82,14 @@ func (ep *EnhancedParser) ParseToSQL(query string) (string, []any, error) {
 
 // ParseToMap parses query and returns map representation
 func (ep *EnhancedParser) ParseToMap(query string) (map[string]any, error) {
+	// Security: Validate query length (OWASP A04: DoS prevention)
+	if len(query) > ep.MaxQueryLength {
+		return nil, fmt.Errorf("query too long: %d bytes exceeds maximum of %d bytes", len(query), ep.MaxQueryLength)
+	}
+
+	// Reset term counter for this parse
+	ep.termCount = 0
+
 	node, err := ep.Parse(query)
 	if err != nil {
 		return nil, err
@@ -84,6 +100,14 @@ func (ep *EnhancedParser) ParseToMap(query string) (map[string]any, error) {
 // ParseToDynamoDBPartiQL parses query and returns DynamoDB PartiQL
 func (ep *EnhancedParser) ParseToDynamoDBPartiQL(query string) (string, []types.AttributeValue, error) {
 	slog.Debug(fmt.Sprintf(`Parsing enhanced query to DynamoDB PartiQL: %s`, query))
+
+	// Security: Validate query length (OWASP A04: DoS prevention)
+	if len(query) > ep.MaxQueryLength {
+		return "", nil, fmt.Errorf("query too long: %d bytes exceeds maximum of %d bytes", len(query), ep.MaxQueryLength)
+	}
+
+	// Reset term counter for this parse
+	ep.termCount = 0
 
 	node, err := ep.Parse(query)
 	if err != nil {
@@ -104,7 +128,21 @@ func (ep *EnhancedParser) Parse(query string) (*EnhancedNode, error) {
 	ep.advance() // Load first token
 	ep.advance() // Load peek token
 
-	return ep.parseExpression()
+	return ep.parseExpressionWithDepth(0)
+}
+
+// parseExpression parses the top-level expression (handles OR)
+func (ep *EnhancedParser) parseExpression() (*EnhancedNode, error) {
+	return ep.parseExpressionWithDepth(0)
+}
+
+// parseExpressionWithDepth parses with depth tracking
+func (ep *EnhancedParser) parseExpressionWithDepth(depth int) (*EnhancedNode, error) {
+	// Security: Check nesting depth (OWASP A04: DoS prevention)
+	if depth > ep.MaxDepth {
+		return nil, fmt.Errorf("query nesting too deep: depth %d exceeds maximum of %d", depth, ep.MaxDepth)
+	}
+	return ep.parseOrWithDepth(depth)
 }
 
 // advance moves to the next token
@@ -113,21 +151,21 @@ func (ep *EnhancedParser) advance() {
 	ep.peek = ep.lexer.NextToken()
 }
 
-// parseExpression parses the top-level expression (handles OR)
-func (ep *EnhancedParser) parseExpression() (*EnhancedNode, error) {
-	return ep.parseOr()
-}
-
 // parseOr handles OR operations
 func (ep *EnhancedParser) parseOr() (*EnhancedNode, error) {
-	left, err := ep.parseAnd()
+	return ep.parseOrWithDepth(0)
+}
+
+// parseOrWithDepth handles OR operations with depth tracking
+func (ep *EnhancedParser) parseOrWithDepth(depth int) (*EnhancedNode, error) {
+	left, err := ep.parseAndWithDepth(depth + 1)
 	if err != nil {
 		return nil, err
 	}
 
 	for ep.current.Type == TokenOR {
 		ep.advance()
-		right, err := ep.parseAnd()
+		right, err := ep.parseAndWithDepth(depth + 1)
 		if err != nil {
 			return nil, err
 		}
@@ -220,7 +258,12 @@ func (ep *EnhancedParser) enhancedNodeToNode(enode *EnhancedNode) *Node {
 
 // parseAnd handles AND operations and implicit AND
 func (ep *EnhancedParser) parseAnd() (*EnhancedNode, error) {
-	left, err := ep.parseUnary()
+	return ep.parseAndWithDepth(0)
+}
+
+// parseAndWithDepth handles AND operations with depth tracking
+func (ep *EnhancedParser) parseAndWithDepth(depth int) (*EnhancedNode, error) {
+	left, err := ep.parseUnaryWithDepth(depth + 1)
 	if err != nil {
 		return nil, err
 	}
@@ -230,7 +273,7 @@ func (ep *EnhancedParser) parseAnd() (*EnhancedNode, error) {
 			ep.advance()
 		}
 		// Implicit AND: if we see another term without an operator
-		right, err := ep.parseUnary()
+		right, err := ep.parseUnaryWithDepth(depth + 1)
 		if err != nil {
 			return nil, err
 		}
@@ -263,10 +306,15 @@ func (ep *EnhancedParser) isImplicitAnd() bool {
 
 // parseUnary handles NOT, required (+), and prohibited (-) operations
 func (ep *EnhancedParser) parseUnary() (*EnhancedNode, error) {
+	return ep.parseUnaryWithDepth(0)
+}
+
+// parseUnaryWithDepth handles unary operations with depth tracking
+func (ep *EnhancedParser) parseUnaryWithDepth(depth int) (*EnhancedNode, error) {
 	// Handle NOT
 	if ep.current.Type == TokenNOT {
 		ep.advance()
-		expr, err := ep.parsePrimary()
+		expr, err := ep.parsePrimaryWithDepth(depth + 1)
 		if err != nil {
 			return nil, err
 		}
@@ -283,7 +331,7 @@ func (ep *EnhancedParser) parseUnary() (*EnhancedNode, error) {
 	// Handle required (+)
 	if ep.current.Type == TokenPlus {
 		ep.advance()
-		expr, err := ep.parsePrimary()
+		expr, err := ep.parsePrimaryWithDepth(depth + 1)
 		if err != nil {
 			return nil, err
 		}
@@ -294,7 +342,7 @@ func (ep *EnhancedParser) parseUnary() (*EnhancedNode, error) {
 	// Handle prohibited (-)
 	if ep.current.Type == TokenMinus {
 		ep.advance()
-		expr, err := ep.parsePrimary()
+		expr, err := ep.parsePrimaryWithDepth(depth + 1)
 		if err != nil {
 			return nil, err
 		}
@@ -302,15 +350,20 @@ func (ep *EnhancedParser) parseUnary() (*EnhancedNode, error) {
 		return expr, nil
 	}
 
-	return ep.parsePrimary()
+	return ep.parsePrimaryWithDepth(depth + 1)
 }
 
 // parsePrimary handles primary expressions (terms, phrases, groups, ranges)
 func (ep *EnhancedParser) parsePrimary() (*EnhancedNode, error) {
+	return ep.parsePrimaryWithDepth(0)
+}
+
+// parsePrimaryWithDepth handles primary expressions with depth tracking
+func (ep *EnhancedParser) parsePrimaryWithDepth(depth int) (*EnhancedNode, error) {
 	// Handle grouped expressions
 	if ep.current.Type == TokenLParen {
 		ep.advance()
-		expr, err := ep.parseExpression()
+		expr, err := ep.parseExpressionWithDepth(depth + 1)
 		if err != nil {
 			return nil, err
 		}
@@ -332,6 +385,12 @@ func (ep *EnhancedParser) parsePrimary() (*EnhancedNode, error) {
 
 // parsePhrase handles quoted phrase searches
 func (ep *EnhancedParser) parsePhrase() (*EnhancedNode, error) {
+	// Security: Check term count (OWASP A04: DoS prevention)
+	ep.termCount++
+	if ep.termCount > ep.MaxTerms {
+		return nil, fmt.Errorf("too many terms: %d exceeds maximum of %d", ep.termCount, ep.MaxTerms)
+	}
+
 	phrase := ep.current.Value
 	ep.advance()
 
@@ -396,6 +455,12 @@ func (ep *EnhancedParser) parseTerm() (*EnhancedNode, error) {
 
 		// Check for quoted phrase after colon
 		if ep.current.Type == TokenString {
+			// Security: Check term count (OWASP A04: DoS prevention)
+			ep.termCount++
+			if ep.termCount > ep.MaxTerms {
+				return nil, fmt.Errorf("too many terms: %d exceeds maximum of %d", ep.termCount, ep.MaxTerms)
+			}
+
 			phrase := ep.current.Value
 			ep.advance()
 
@@ -436,6 +501,12 @@ func (ep *EnhancedParser) parseTerm() (*EnhancedNode, error) {
 		// Regular field:value (or wildcard value)
 		if ep.current.Type != TokenIdent && ep.current.Type != TokenNumber && ep.current.Type != TokenWildcard {
 			return nil, fmt.Errorf("expected value after ':', got %v", ep.current.Value)
+		}
+
+		// Security: Check term count (OWASP A04: DoS prevention)
+		ep.termCount++
+		if ep.termCount > ep.MaxTerms {
+			return nil, fmt.Errorf("too many terms: %d exceeds maximum of %d", ep.termCount, ep.MaxTerms)
 		}
 
 		// Build the value, potentially including wildcards
@@ -519,6 +590,13 @@ func (ep *EnhancedParser) parseTerm() (*EnhancedNode, error) {
 
 // parseRange handles range queries [min TO max] or {min TO max}
 func (ep *EnhancedParser) parseRange(field string) (*EnhancedNode, error) {
+	// Security: Check term count (OWASP A04: DoS prevention)
+	// Range queries count as terms (they expand to comparison operations)
+	ep.termCount++
+	if ep.termCount > ep.MaxTerms {
+		return nil, fmt.Errorf("too many terms: %d exceeds maximum of %d", ep.termCount, ep.MaxTerms)
+	}
+
 	inclusive := ep.current.Type == TokenLBracket
 	ep.advance()
 
@@ -595,6 +673,13 @@ func (ep *EnhancedParser) createImplicitSearch(term string) (*EnhancedNode, erro
 	// Create OR node with children for each default field
 	var children []*Node
 	for _, field := range ep.DefaultFields {
+		// Security: Check term count (OWASP A04: DoS prevention)
+		// Each default field counts as a term in implicit search
+		ep.termCount++
+		if ep.termCount > ep.MaxTerms {
+			return nil, fmt.Errorf("too many terms: %d exceeds maximum of %d", ep.termCount, ep.MaxTerms)
+		}
+
 		formattedField := ep.formatFieldName(field.Name)
 
 		// Determine if wildcard

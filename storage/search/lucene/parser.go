@@ -10,6 +10,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
 )
 
+// Safety limits for query parsing (OWASP A04: Insecure Design - DoS prevention)
+const (
+	DefaultMaxQueryLength = 10000 // 10KB - prevents memory exhaustion
+	DefaultMaxDepth       = 20    // Prevents stack overflow from deep nesting
+	DefaultMaxTerms       = 100   // Prevents CPU exhaustion from complex queries
+)
+
 type FieldInfo struct {
 	Name    string
 	IsJSONB bool
@@ -17,6 +24,14 @@ type FieldInfo struct {
 
 type Parser struct {
 	DefaultFields []FieldInfo
+
+	// Security limits (configurable with safe defaults)
+	MaxQueryLength int // Maximum query string length (default: 10KB)
+	MaxDepth       int // Maximum nesting depth (default: 20)
+	MaxTerms       int // Maximum number of terms (default: 100)
+
+	// Internal tracking
+	termCount int // Tracks number of terms during parsing
 }
 
 type NodeType int
@@ -74,7 +89,12 @@ func NewParserFromType(model any) (*Parser, error) {
 }
 
 func NewParser(defaultFields []FieldInfo) *Parser {
-	return &Parser{DefaultFields: defaultFields}
+	return &Parser{
+		DefaultFields:  defaultFields,
+		MaxQueryLength: DefaultMaxQueryLength,
+		MaxDepth:       DefaultMaxDepth,
+		MaxTerms:       DefaultMaxTerms,
+	}
 }
 
 func getStructFields(model any) ([]FieldInfo, error) {
@@ -112,13 +132,21 @@ func getStructFields(model any) ([]FieldInfo, error) {
 }
 
 func (p *Parser) ParseToMap(query string) (map[string]any, error) {
+	// Security: Validate query length (OWASP A04: DoS prevention)
+	if len(query) > p.MaxQueryLength {
+		return nil, fmt.Errorf("query too long: %d bytes exceeds maximum of %d bytes", len(query), p.MaxQueryLength)
+	}
+
+	// Reset term counter for this parse
+	p.termCount = 0
+
 	// Try enhanced parser first for full Lucene syntax support
 	if ep := p.tryEnhancedParser(query); ep != nil {
 		return ep.ParseToMap(query)
 	}
 
 	// Fallback to legacy parser
-	node, err := p.parse(query)
+	node, err := p.parseWithDepth(query, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -128,6 +156,14 @@ func (p *Parser) ParseToMap(query string) (map[string]any, error) {
 func (p *Parser) ParseToSQL(query string) (string, []any, error) {
 	slog.Debug(fmt.Sprintf(`Parsing query to sql: %s`, query))
 
+	// Security: Validate query length (OWASP A04: DoS prevention)
+	if len(query) > p.MaxQueryLength {
+		return "", nil, fmt.Errorf("query too long: %d bytes exceeds maximum of %d bytes", len(query), p.MaxQueryLength)
+	}
+
+	// Reset term counter for this parse
+	p.termCount = 0
+
 	// Try enhanced parser first for full Lucene syntax support
 	if ep := p.tryEnhancedParser(query); ep != nil {
 		return ep.ParseToSQL(query)
@@ -136,7 +172,7 @@ func (p *Parser) ParseToSQL(query string) (string, []any, error) {
 	// Fallback to legacy parser
 	re := regexp.MustCompile(`(\w+):"([^"]+)"`)
 	query = re.ReplaceAllString(query, `$1:$2`)
-	node, err := p.parse(query)
+	node, err := p.parseWithDepth(query, 0)
 	if err != nil {
 		return "", nil, err
 	}
@@ -160,29 +196,40 @@ func (p *Parser) tryEnhancedParser(query string) *EnhancedParser {
 		strings.Contains(query, " -")
 
 	if hasEnhancedSyntax {
-		return NewEnhancedParser(p.DefaultFields)
+		ep := NewEnhancedParser(p.DefaultFields)
+		// Transfer security limits from parent parser
+		ep.MaxQueryLength = p.MaxQueryLength
+		ep.MaxDepth = p.MaxDepth
+		ep.MaxTerms = p.MaxTerms
+		return ep
 	}
 	return nil
 }
 
-func (p *Parser) parse(query string) (*Node, error) {
+// parseWithDepth parses a query with depth tracking to prevent stack overflow
+func (p *Parser) parseWithDepth(query string, depth int) (*Node, error) {
+	// Security: Check nesting depth (OWASP A04: DoS prevention)
+	if depth > p.MaxDepth {
+		return nil, fmt.Errorf("query nesting too deep: depth %d exceeds maximum of %d", depth, p.MaxDepth)
+	}
+
 	query = strings.TrimSpace(query)
 	if query == "" {
 		return nil, nil
 	}
 
 	if strings.HasPrefix(query, "(") && strings.HasSuffix(query, ")") {
-		return p.parse(query[1 : len(query)-1])
+		return p.parseWithDepth(query[1:len(query)-1], depth+1)
 	}
 
 	if andParts := splitByOperator(query, "AND"); len(andParts) > 1 {
-		return p.createLogicalNode(AND, andParts)
+		return p.createLogicalNodeWithDepth(AND, andParts, depth)
 	}
 	if orParts := splitByOperator(query, "OR"); len(orParts) > 1 {
-		return p.createLogicalNode(OR, orParts)
+		return p.createLogicalNodeWithDepth(OR, orParts, depth)
 	}
 	if notParts := splitByOperator(query, "NOT"); len(notParts) > 1 {
-		return p.createLogicalNode(NOT, notParts)
+		return p.createLogicalNodeWithDepth(NOT, notParts, depth)
 	}
 
 	if parts := strings.SplitN(query, ":", 2); len(parts) == 2 {
@@ -265,6 +312,12 @@ func (p *Parser) createImplicitNode(term string) (*Node, error) {
 }
 
 func (p *Parser) createWildcardNode(field, value string) (*Node, error) {
+	// Security: Check term count (OWASP A04: DoS prevention)
+	p.termCount++
+	if p.termCount > p.MaxTerms {
+		return nil, fmt.Errorf("too many terms: %d exceeds maximum of %d", p.termCount, p.MaxTerms)
+	}
+
 	// Skip empty fields or values
 	field = strings.TrimSpace(field)
 	value = strings.TrimSpace(value)
@@ -327,6 +380,12 @@ func (p *Parser) formatFieldName(fieldName string) string {
 }
 
 func (p *Parser) createTermNode(field, value string) (*Node, error) {
+	// Security: Check term count (OWASP A04: DoS prevention)
+	p.termCount++
+	if p.termCount > p.MaxTerms {
+		return nil, fmt.Errorf("too many terms: %d exceeds maximum of %d", p.termCount, p.MaxTerms)
+	}
+
 	field = strings.TrimSpace(field)
 	value = strings.TrimSpace(value)
 
@@ -377,7 +436,7 @@ func (p *Parser) createTermNode(field, value string) (*Node, error) {
 	return node, nil
 }
 
-func (p *Parser) createLogicalNode(op LogicalOperator, parts []string) (*Node, error) {
+func (p *Parser) createLogicalNodeWithDepth(op LogicalOperator, parts []string, depth int) (*Node, error) {
 	node := &Node{
 		Type:     NodeLogical,
 		Operator: op,
@@ -387,7 +446,7 @@ func (p *Parser) createLogicalNode(op LogicalOperator, parts []string) (*Node, e
 		if strings.TrimSpace(part) == "" {
 			continue
 		}
-		child, err := p.parse(part)
+		child, err := p.parseWithDepth(part, depth+1)
 		if err != nil {
 			return nil, err
 		}
@@ -483,13 +542,21 @@ func (p *Parser) nodeToSQL(node *Node) (string, []any, error) {
 func (p *Parser) ParseToDynamoDBPartiQL(query string) (string, []types.AttributeValue, error) {
 	slog.Debug(fmt.Sprintf(`Parsing query to DynamoDB PartiQL: %s`, query))
 
+	// Security: Validate query length (OWASP A04: DoS prevention)
+	if len(query) > p.MaxQueryLength {
+		return "", nil, fmt.Errorf("query too long: %d bytes exceeds maximum of %d bytes", len(query), p.MaxQueryLength)
+	}
+
+	// Reset term counter for this parse
+	p.termCount = 0
+
 	// Try enhanced parser first for full Lucene syntax support
 	if ep := p.tryEnhancedParser(query); ep != nil {
 		return ep.ParseToDynamoDBPartiQL(query)
 	}
 
 	// Fallback to legacy parser
-	node, err := p.parse(query)
+	node, err := p.parseWithDepth(query, 0)
 	if err != nil {
 		return "", nil, err
 	}
