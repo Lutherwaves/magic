@@ -56,7 +56,7 @@ func (p *PostgresJSONBDriver) RenderParam(e *expr.Expression) (string, []any, er
 	// Process JSONB field notation before rendering
 	p.processJSONBFields(e)
 
-	// Use base rendering with ? placeholders
+	// Use our custom rendering logic
 	str, params, err := p.renderParamInternal(e)
 	if err != nil {
 		return "", nil, err
@@ -75,7 +75,7 @@ func (p *PostgresJSONBDriver) renderParamInternal(e *expr.Expression) (string, [
 	}
 
 	// Special handling for LIKE operator - convert to ILIKE
-	if e.Op == expr.Like {
+	if e.Op == expr.Like || e.Op == expr.Wild {
 		// Get the left side (column name)
 		leftStr, leftParams, err := p.serializeColumn(e.Left)
 		if err != nil {
@@ -99,11 +99,43 @@ func (p *PostgresJSONBDriver) renderParamInternal(e *expr.Expression) (string, [
 
 	// Special handling for Range operator - handle open-ended ranges with *
 	if e.Op == expr.Range {
-		fmt.Printf("DEBUG renderParamInternal: detected Range operator, calling renderRange\n")
 		return p.renderRange(e)
 	}
 
-	fmt.Printf("DEBUG renderParamInternal: Op=%v, delegating to Base.RenderParam\n", e.Op)
+	// For binary operators (AND, OR, etc.), recursively process left and right
+	if e.Left != nil && e.Right != nil {
+		// Check if Left and Right are expressions
+		leftExpr, leftIsExpr := e.Left.(*expr.Expression)
+		rightExpr, rightIsExpr := e.Right.(*expr.Expression)
+
+		// If both are expressions, recursively render them
+		if leftIsExpr && rightIsExpr {
+			leftStr, leftParams, err := p.renderParamInternal(leftExpr)
+			if err != nil {
+				return "", nil, err
+			}
+
+			rightStr, rightParams, err := p.renderParamInternal(rightExpr)
+			if err != nil {
+				return "", nil, err
+			}
+
+			params := append(leftParams, rightParams...)
+
+			// Use the appropriate operator
+			switch e.Op {
+			case expr.And:
+				return fmt.Sprintf("(%s) AND (%s)", leftStr, rightStr), params, nil
+			case expr.Or:
+				return fmt.Sprintf("(%s) OR (%s)", leftStr, rightStr), params, nil
+			case expr.Must:
+				return rightStr, params, nil
+			case expr.MustNot:
+				return fmt.Sprintf("NOT (%s)", rightStr), params, nil
+			}
+		}
+	}
+
 	// Use base implementation for all other operators
 	return p.Base.RenderParam(e)
 }
@@ -118,6 +150,12 @@ func (p *PostgresJSONBDriver) serializeColumn(in any) (string, []any, error) {
 			return colStr, nil, nil
 		}
 		return fmt.Sprintf(`"%s"`, colStr), nil, nil
+	case string:
+		// Handle string columns (for some operators)
+		if strings.Contains(v, "->>") {
+			return v, nil, nil
+		}
+		return fmt.Sprintf(`"%s"`, v), nil, nil
 	case *expr.Expression:
 		// Handle LITERAL(COLUMN(...)) pattern
 		if v.Op == expr.Literal && v.Left != nil {
@@ -130,8 +168,8 @@ func (p *PostgresJSONBDriver) serializeColumn(in any) (string, []any, error) {
 				return fmt.Sprintf(`"%s"`, colStr), nil, nil
 			}
 		}
-		// For other expressions, use base renderer
-		return p.Base.RenderParam(v)
+		// For other expressions, recursively render using our custom logic
+		return p.renderParamInternal(v)
 	default:
 		return "", nil, fmt.Errorf("unexpected column type: %T", v)
 	}
@@ -276,14 +314,11 @@ func extractLiteralValue(v any) string {
 
 // renderRange handles range expressions with support for open-ended ranges (*).
 func (p *PostgresJSONBDriver) renderRange(e *expr.Expression) (string, []any, error) {
-	fmt.Printf("DEBUG renderRange: CALLED for expression: %v\n", e)
-
 	// Get column name
 	colStr, _, err := p.serializeColumn(e.Left)
 	if err != nil {
 		return "", nil, err
 	}
-	fmt.Printf("DEBUG renderRange: colStr=%q\n", colStr)
 
 	// The Right side should be a RangeBoundary
 	rangeBoundary, ok := e.Right.(*expr.RangeBoundary)
@@ -298,17 +333,12 @@ func (p *PostgresJSONBDriver) renderRange(e *expr.Expression) (string, []any, er
 	// Extract Min value
 	if rangeBoundary.Min != nil {
 		minVal = extractLiteralValue(rangeBoundary.Min)
-		fmt.Printf("DEBUG renderRange: extracted minVal=%q (from type=%T)\n", minVal, rangeBoundary.Min)
 	}
 
 	// Extract Max value
 	if rangeBoundary.Max != nil {
 		maxVal = extractLiteralValue(rangeBoundary.Max)
-		fmt.Printf("DEBUG renderRange: extracted maxVal=%q (from type=%T)\n", maxVal, rangeBoundary.Max)
 	}
-
-	fmt.Printf("DEBUG renderRange: checking - minVal=%q maxVal=%q, minVal==\"*\"?%v maxVal==\"*\"?%v\n",
-		minVal, maxVal, minVal == "*", maxVal == "*")
 
 	// Handle open-ended ranges
 	if minVal == "*" && maxVal == "*" {
