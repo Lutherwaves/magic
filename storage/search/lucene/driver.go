@@ -184,7 +184,25 @@ func (p *PostgresJSONBDriver) serializeValue(in any) (string, []any, error) {
 		val = strings.ReplaceAll(val, "?", "_")
 		return "?", []any{val}, nil
 	case *expr.Expression:
-		return p.Base.RenderParam(v)
+		// For LITERAL expressions, extract the value and convert wildcards
+		if v.Op == expr.Literal && v.Left != nil {
+			// Extract the literal value
+			literalVal := fmt.Sprintf("%v", v.Left)
+			// Convert wildcards
+			literalVal = strings.ReplaceAll(literalVal, "*", "%")
+			literalVal = strings.ReplaceAll(literalVal, "?", "_")
+			return "?", []any{literalVal}, nil
+		}
+		// For WILD expressions, extract the pattern from Left
+		if v.Op == expr.Wild && v.Left != nil {
+			literalVal := fmt.Sprintf("%v", v.Left)
+			// Convert wildcards
+			literalVal = strings.ReplaceAll(literalVal, "*", "%")
+			literalVal = strings.ReplaceAll(literalVal, "?", "_")
+			return "?", []any{literalVal}, nil
+		}
+		// For other expression types, this is unexpected in value context
+		return "", nil, fmt.Errorf("unexpected expression type in value position: %v", v.Op)
 	default:
 		return "?", []any{v}, nil
 	}
