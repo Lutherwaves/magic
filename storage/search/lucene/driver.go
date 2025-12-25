@@ -28,17 +28,17 @@ func NewPostgresJSONBDriver(fields []FieldInfo) *PostgresJSONBDriver {
 		expr.And:       driver.Shared[expr.And],
 		expr.Or:        driver.Shared[expr.Or],
 		expr.Not:       driver.Shared[expr.Not],
-		expr.Equals:    driver.Shared[expr.Equals],
+		expr.Equals:    customPostgresEquals,    // Custom to handle JSONB syntax
 		expr.Range:     driver.Shared[expr.Range],
 		expr.Must:      driver.Shared[expr.Must],
 		expr.MustNot:   driver.Shared[expr.MustNot],
 		expr.Wild:      driver.Shared[expr.Wild],
 		expr.Regexp:    driver.Shared[expr.Regexp],
-		expr.Like:      customPostgresLike, // Custom LIKE to use ILIKE
-		expr.Greater:   driver.Shared[expr.Greater],
-		expr.GreaterEq: driver.Shared[expr.GreaterEq],
-		expr.Less:      driver.Shared[expr.Less],
-		expr.LessEq:    driver.Shared[expr.LessEq],
+		expr.Like:      customPostgresLike,      // Custom LIKE to use ILIKE
+		expr.Greater:   customPostgresComparison(">"),
+		expr.GreaterEq: customPostgresComparison(">="),
+		expr.Less:      customPostgresComparison("<"),
+		expr.LessEq:    customPostgresComparison("<="),
 		expr.In:        driver.Shared[expr.In],
 		expr.List:      driver.Shared[expr.List],
 	}
@@ -105,8 +105,25 @@ func (p *PostgresJSONBDriver) renderParamInternal(e *expr.Expression) (string, [
 func (p *PostgresJSONBDriver) serializeColumn(in any) (string, []any, error) {
 	switch v := in.(type) {
 	case expr.Column:
-		return fmt.Sprintf(`"%s"`, string(v)), nil, nil
+		colStr := string(v)
+		// Don't quote JSONB syntax (contains ->>)
+		if strings.Contains(colStr, "->>") {
+			return colStr, nil, nil
+		}
+		return fmt.Sprintf(`"%s"`, colStr), nil, nil
 	case *expr.Expression:
+		// Handle LITERAL(COLUMN(...)) pattern
+		if v.Op == expr.Literal && v.Left != nil {
+			if col, ok := v.Left.(expr.Column); ok {
+				colStr := string(col)
+				// Don't quote JSONB syntax
+				if strings.Contains(colStr, "->>") {
+					return colStr, nil, nil
+				}
+				return fmt.Sprintf(`"%s"`, colStr), nil, nil
+			}
+		}
+		// For other expressions, use base renderer
 		return p.Base.RenderParam(v)
 	default:
 		return "", nil, fmt.Errorf("unexpected column type: %T", v)
@@ -176,8 +193,37 @@ func (p *PostgresJSONBDriver) formatFieldName(fieldName string) expr.Column {
 	return expr.Column(fieldName)
 }
 
+// unquoteJSONB removes quotes from JSONB syntax to make it work in PostgreSQL.
+// Converts: "labels->>'key'" to: labels->>'key'
+func unquoteJSONB(col string) string {
+	if strings.Contains(col, "->>") {
+		// Remove only the outermost quotes if they exist
+		if len(col) >= 2 && col[0] == '"' && col[len(col)-1] == '"' {
+			return col[1 : len(col)-1]
+		}
+	}
+	return col
+}
+
+// customPostgresEquals implements Equals operator with JSONB support.
+func customPostgresEquals(left, right string) (string, error) {
+	left = unquoteJSONB(left)
+	return fmt.Sprintf("%s = %s", left, right), nil
+}
+
+// customPostgresComparison creates comparison operators (>, >=, <, <=) with JSONB support.
+func customPostgresComparison(op string) driver.RenderFN {
+	return func(left, right string) (string, error) {
+		left = unquoteJSONB(left)
+		return fmt.Sprintf("%s %s %s", left, op, right), nil
+	}
+}
+
 // customPostgresLike implements case-insensitive LIKE using ILIKE.
 func customPostgresLike(left, right string) (string, error) {
+	// Unquote JSONB syntax first
+	left = unquoteJSONB(left)
+
 	// Check if it's a regex pattern /.../
 	if len(right) >= 4 && right[1] == '/' && right[len(right)-2] == '/' {
 		return fmt.Sprintf("%s ~ %s", left, right), nil
@@ -189,10 +235,10 @@ func customPostgresLike(left, right string) (string, error) {
 
 	// Use ILIKE for case-insensitive matching
 	// Also cast field to text if it's not already JSONB syntax
-	if !strings.Contains(left, "->>") {
-		return fmt.Sprintf("%s::text ILIKE %s", left, right), nil
+	if strings.Contains(left, "->>") {
+		return fmt.Sprintf("%s ILIKE %s", left, right), nil
 	}
-	return fmt.Sprintf("%s ILIKE %s", left, right), nil
+	return fmt.Sprintf("%s::text ILIKE %s", left, right), nil
 }
 
 // DynamoDBPartiQLDriver converts Lucene queries to DynamoDB PartiQL.
