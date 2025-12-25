@@ -109,6 +109,41 @@ func (p *PostgresJSONBDriver) renderParamInternal(e *expr.Expression) (string, [
 		return p.renderRange(e)
 	}
 
+	// Special handling for comparison operators (=, >, <, >=, <=) to ensure JSONB syntax is unquoted
+	if e.Op == expr.Equals || e.Op == expr.Greater || e.Op == expr.Less ||
+	   e.Op == expr.GreaterEq || e.Op == expr.LessEq {
+		// Get the left side (column name)
+		leftStr, leftParams, err := p.serializeColumn(e.Left)
+		if err != nil {
+			return "", nil, err
+		}
+
+		// Get the right side value
+		rightStr, rightParams, err := p.serializeValue(e.Right)
+		if err != nil {
+			return "", nil, err
+		}
+
+		params := append(leftParams, rightParams...)
+
+		// Determine the operator symbol
+		var opSymbol string
+		switch e.Op {
+		case expr.Equals:
+			opSymbol = "="
+		case expr.Greater:
+			opSymbol = ">"
+		case expr.Less:
+			opSymbol = "<"
+		case expr.GreaterEq:
+			opSymbol = ">="
+		case expr.LessEq:
+			opSymbol = "<="
+		}
+
+		return fmt.Sprintf("%s %s %s", leftStr, opSymbol, rightStr), params, nil
+	}
+
 	// For binary operators (AND, OR, etc.), recursively process left and right
 	if e.Left != nil && e.Right != nil {
 		// Check if Left and Right are expressions
