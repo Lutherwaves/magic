@@ -9,11 +9,6 @@ import (
 	"github.com/grindlemire/go-lucene/pkg/lucene/expr"
 )
 
-// Security (OWASP Top 10 Compliance):
-// - A03 Injection: All queries use parameterized statements (? placeholders → $N)
-//   preventing SQL injection attacks
-// - A04 Insecure Design: DoS protection via query length limits (see parser.go)
-
 // PostgresJSONBDriver is a custom PostgreSQL driver that supports JSONB field notation.
 // It extends the base PostgreSQL driver to handle field->>'subfield' syntax.
 type PostgresJSONBDriver struct {
@@ -75,111 +70,213 @@ func (p *PostgresJSONBDriver) RenderParam(e *expr.Expression) (string, []any, er
 	return str, params, nil
 }
 
-// renderParamInternal handles rendering with special ILIKE and Range logic.
+// renderParamInternal dispatches to specialized renderers based on operator type.
 func (p *PostgresJSONBDriver) renderParamInternal(e *expr.Expression) (string, []any, error) {
 	if e == nil {
 		return "", nil, nil
 	}
 
-	// Special handling for LIKE operator - convert to ILIKE
-	if e.Op == expr.Like || e.Op == expr.Wild {
-		// Get the left side (column name)
-		leftStr, leftParams, err := p.serializeColumn(e.Left)
-		if err != nil {
-			return "", nil, err
-		}
-
-		// Get the right side value (the pattern)
-		rightStr, rightParams, err := p.serializeValue(e.Right)
-		if err != nil {
-			return "", nil, err
-		}
-
-		params := append(leftParams, rightParams...)
-
-		// Check if left contains JSONB syntax
-		if isJSONBSyntax(leftStr) {
-			return fmt.Sprintf("%s ILIKE %s", leftStr, rightStr), params, nil
-		}
-		return fmt.Sprintf("%s::text ILIKE %s", leftStr, rightStr), params, nil
-	}
-
-	// Special handling for Range operator - handle open-ended ranges with *
-	if e.Op == expr.Range {
+	switch e.Op {
+	case expr.Like, expr.Wild:
+		return p.renderLikeOrWild(e)
+	case expr.Fuzzy:
+		return p.renderFuzzy(e)
+	case expr.Boost:
+		return "", nil, fmt.Errorf("boost operator (^) is not supported in SQL filtering; it only affects ranking/scoring")
+	case expr.Range:
 		return p.renderRange(e)
+	case expr.Equals, expr.Greater, expr.Less, expr.GreaterEq, expr.LessEq:
+		return p.renderComparison(e)
+	case expr.And, expr.Or, expr.Must, expr.MustNot:
+		return p.renderBinary(e)
+	default:
+		// Use base implementation for all other operators
+		return p.Base.RenderParam(e)
+	}
+}
+
+// renderLikeOrWild handles LIKE and Wild operators, converting them to PostgreSQL ILIKE.
+func (p *PostgresJSONBDriver) renderLikeOrWild(e *expr.Expression) (string, []any, error) {
+	// Get the left side (column name)
+	leftStr, leftParams, err := p.serializeColumn(e.Left)
+	if err != nil {
+		return "", nil, err
 	}
 
-	// Special handling for comparison operators (=, >, <, >=, <=) to ensure JSONB syntax is unquoted
-	if e.Op == expr.Equals || e.Op == expr.Greater || e.Op == expr.Less ||
-	   e.Op == expr.GreaterEq || e.Op == expr.LessEq {
-		// Get the left side (column name)
-		leftStr, leftParams, err := p.serializeColumn(e.Left)
-		if err != nil {
-			return "", nil, err
-		}
-
-		// Get the right side value
-		rightStr, rightParams, err := p.serializeValue(e.Right)
-		if err != nil {
-			return "", nil, err
-		}
-
-		params := append(leftParams, rightParams...)
-
-		// Determine the operator symbol
-		var opSymbol string
-		switch e.Op {
-		case expr.Equals:
-			opSymbol = "="
-		case expr.Greater:
-			opSymbol = ">"
-		case expr.Less:
-			opSymbol = "<"
-		case expr.GreaterEq:
-			opSymbol = ">="
-		case expr.LessEq:
-			opSymbol = "<="
-		}
-
-		return fmt.Sprintf("%s %s %s", leftStr, opSymbol, rightStr), params, nil
+	// Get the right side value (the pattern)
+	rightStr, rightParams, err := p.serializeValue(e.Right)
+	if err != nil {
+		return "", nil, err
 	}
 
-	// For binary operators (AND, OR, etc.), recursively process left and right
-	if e.Left != nil && e.Right != nil {
-		// Check if Left and Right are expressions
-		leftExpr, leftIsExpr := e.Left.(*expr.Expression)
-		rightExpr, rightIsExpr := e.Right.(*expr.Expression)
+	params := append(leftParams, rightParams...)
 
-		// If both are expressions, recursively render them
-		if leftIsExpr && rightIsExpr {
+	// Check if left contains JSONB syntax
+	if isJSONBSyntax(leftStr) {
+		return fmt.Sprintf("%s ILIKE %s", leftStr, rightStr), params, nil
+	}
+	return fmt.Sprintf("%s::text ILIKE %s", leftStr, rightStr), params, nil
+}
+
+// renderFuzzy handles fuzzy search using PostgreSQL similarity() function.
+// Requires pg_trgm extension.
+// For queries like "name:roam~2", the structure is:
+// - Op: Fuzzy
+// - Left: Equals expression (name:roam) with Left=Column("name"), Right=Literal("roam")
+// - Right: nil (distance stored in unexported fuzzyDistance field)
+func (p *PostgresJSONBDriver) renderFuzzy(e *expr.Expression) (string, []any, error) {
+	// Left side must be an Equals expression (field:value)
+	leftExpr, ok := e.Left.(*expr.Expression)
+	if !ok || leftExpr.Op != expr.Equals {
+		return "", nil, fmt.Errorf("fuzzy operator requires field:value syntax (e.g., name:roam~2)")
+	}
+
+	// Extract column from the Equals expression's left side
+	colStr, colParams, err := p.serializeColumn(leftExpr.Left)
+	if err != nil {
+		return "", nil, err
+	}
+
+	// Extract search term from the Equals expression's right side
+	termStr, termParams, err := p.serializeValue(leftExpr.Right)
+	if err != nil {
+		return "", nil, err
+	}
+
+	params := append(colParams, termParams...)
+
+	// Use similarity threshold of 0.3 (default for fuzzy search)
+	// Lower threshold = more matches, higher = stricter matching
+	// The fuzzy distance from go-lucene is not directly accessible (unexported),
+	// so we use a reasonable default threshold
+	threshold := 0.3
+
+	// For JSONB fields, we need to cast to text for similarity
+	if isJSONBSyntax(colStr) {
+		return fmt.Sprintf("similarity(%s, %s) > %f", colStr, termStr, threshold), params, nil
+	}
+	return fmt.Sprintf("similarity(%s::text, %s) > %f", colStr, termStr, threshold), params, nil
+}
+
+// renderComparison handles comparison operators (=, >, <, >=, <=) with nil/null support.
+func (p *PostgresJSONBDriver) renderComparison(e *expr.Expression) (string, []any, error) {
+	// Get the left side (column name)
+	leftStr, leftParams, err := p.serializeColumn(e.Left)
+	if err != nil {
+		return "", nil, err
+	}
+
+	// Check if right side is nil/null for IS NULL handling
+	if isNilValue(e.Right) {
+		if e.Op == expr.Equals {
+			return fmt.Sprintf("%s IS NULL", leftStr), leftParams, nil
+		}
+		return "", nil, fmt.Errorf("cannot use comparison operators (>, <, >=, <=) with nil value")
+	}
+
+	// Get the right side value
+	rightStr, rightParams, err := p.serializeValue(e.Right)
+	if err != nil {
+		return "", nil, err
+	}
+
+	params := append(leftParams, rightParams...)
+
+	// Determine the operator symbol
+	var opSymbol string
+	switch e.Op {
+	case expr.Equals:
+		opSymbol = "="
+	case expr.Greater:
+		opSymbol = ">"
+	case expr.Less:
+		opSymbol = "<"
+	case expr.GreaterEq:
+		opSymbol = ">="
+	case expr.LessEq:
+		opSymbol = "<="
+	}
+
+	return fmt.Sprintf("%s %s %s", leftStr, opSymbol, rightStr), params, nil
+}
+
+// renderBinary handles binary operators (AND, OR, Must, MustNot) with recursive rendering.
+// Note: Must and MustNot are unary operators (only Right operand), while And and Or are binary.
+func (p *PostgresJSONBDriver) renderBinary(e *expr.Expression) (string, []any, error) {
+	switch e.Op {
+	case expr.Must, expr.MustNot:
+		// Unary operators: operand is in Left (not Right)
+		if e.Left == nil {
+			return "", nil, fmt.Errorf("%s operator requires a left operand", e.Op)
+		}
+
+		// Try to render Left as an expression first
+		if leftExpr, ok := e.Left.(*expr.Expression); ok {
 			leftStr, leftParams, err := p.renderParamInternal(leftExpr)
 			if err != nil {
 				return "", nil, err
 			}
 
-			rightStr, rightParams, err := p.renderParamInternal(rightExpr)
-			if err != nil {
-				return "", nil, err
+			if e.Op == expr.Must {
+				return leftStr, leftParams, nil
 			}
+			// MustNot
+			return fmt.Sprintf("NOT (%s)", leftStr), leftParams, nil
+		}
 
-			params := append(leftParams, rightParams...)
-
-			// Use the appropriate operator
-			switch e.Op {
-			case expr.And:
-				return fmt.Sprintf("(%s) AND (%s)", leftStr, rightStr), params, nil
-			case expr.Or:
-				return fmt.Sprintf("(%s) OR (%s)", leftStr, rightStr), params, nil
-			case expr.Must:
-				return rightStr, params, nil
-			case expr.MustNot:
-				return fmt.Sprintf("NOT (%s)", rightStr), params, nil
+		// If Left is not an expression, try to render it directly
+		// This handles cases where Left might be a Column, Literal, etc.
+		leftStr, leftParams, err := p.serializeColumn(e.Left)
+		if err != nil {
+			// Try as a value if column serialization fails
+			leftStr, leftParams, err = p.serializeValue(e.Left)
+			if err != nil {
+				// Fallback to base implementation if we can't serialize
+				return p.Base.RenderParam(e)
 			}
 		}
-	}
 
-	// Use base implementation for all other operators
-	return p.Base.RenderParam(e)
+		if e.Op == expr.Must {
+			return leftStr, leftParams, nil
+		}
+		// MustNot
+		return fmt.Sprintf("NOT (%s)", leftStr), leftParams, nil
+
+	case expr.And, expr.Or:
+		// Binary operators: both Left and Right operands are required
+		if e.Left == nil || e.Right == nil {
+			return "", nil, fmt.Errorf("%s operator requires both left and right operands", e.Op)
+		}
+
+		leftExpr, leftIsExpr := e.Left.(*expr.Expression)
+		rightExpr, rightIsExpr := e.Right.(*expr.Expression)
+
+		if !leftIsExpr || !rightIsExpr {
+			// Fallback to base implementation if operands aren't expressions
+			return p.Base.RenderParam(e)
+		}
+
+		leftStr, leftParams, err := p.renderParamInternal(leftExpr)
+		if err != nil {
+			return "", nil, err
+		}
+
+		rightStr, rightParams, err := p.renderParamInternal(rightExpr)
+		if err != nil {
+			return "", nil, err
+		}
+
+		params := append(leftParams, rightParams...)
+
+		if e.Op == expr.And {
+			return fmt.Sprintf("(%s) AND (%s)", leftStr, rightStr), params, nil
+		}
+		// Or
+		return fmt.Sprintf("(%s) OR (%s)", leftStr, rightStr), params, nil
+
+	default:
+		return "", nil, fmt.Errorf("unsupported operator: %v", e.Op)
+	}
 }
 
 // serializeColumn serializes a column reference.
@@ -233,8 +330,11 @@ func (p *PostgresJSONBDriver) serializeValue(in any) (string, []any, error) {
 			literalVal := fmt.Sprintf("%v", v.Left)
 			return "?", []any{convertWildcards(literalVal)}, nil
 		}
-		// For other expression types, this is unexpected in value context
-		return "", nil, fmt.Errorf("unexpected expression type in value position: %v", v.Op)
+		// For nested expressions, recursively render
+		return p.renderParamInternal(v)
+	case nil:
+		// Handle nil value - this can happen with malformed expressions
+		return "", nil, fmt.Errorf("nil value in expression")
 	default:
 		return "?", []any{v}, nil
 	}
@@ -293,15 +393,59 @@ func (p *PostgresJSONBDriver) formatFieldName(fieldName string) expr.Column {
 // convertWildcards converts Lucene wildcards to SQL wildcards.
 // * (any characters) → % (SQL wildcard)
 // ? (single character) → _ (SQL wildcard)
+//
+// Note: go-lucene's base driver also converts wildcards, but only for expr.Like operators.
+// We need this function because we also convert wildcards for expr.Wild expressions
+// and when serializing values for fuzzy search and other operators.
 func convertWildcards(s string) string {
-	s = strings.ReplaceAll(s, "*", "%")
-	s = strings.ReplaceAll(s, "?", "_")
-	return s
+	// Use a builder for efficient string manipulation
+	var result strings.Builder
+	result.Grow(len(s))
+
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch c {
+		case '*':
+			result.WriteByte('%')
+		case '?':
+			result.WriteByte('_')
+		default:
+			result.WriteByte(c)
+		}
+	}
+	return result.String()
 }
 
 // isJSONBSyntax checks if a column string contains JSONB accessor syntax.
 func isJSONBSyntax(col string) bool {
 	return strings.Contains(col, "->>")
+}
+
+// isNilValue checks if a value represents nil/null in Lucene query syntax.
+// Supports: nil, null, NULL (case-insensitive)
+// Note: We intentionally do NOT support "empty" as it could be a legitimate search value.
+func isNilValue(v any) bool {
+	strVal := extractStringValue(v)
+	if strVal == "" {
+		return false
+	}
+	lower := strings.ToLower(strVal)
+	return lower == "nil" || lower == "null"
+}
+
+// extractStringValue extracts a string value from various expression types.
+func extractStringValue(v any) string {
+	switch val := v.(type) {
+	case string:
+		return val
+	case *expr.Expression:
+		if val.Op == expr.Literal && val.Left != nil {
+			if strVal, ok := val.Left.(string); ok {
+				return strVal
+			}
+		}
+	}
+	return ""
 }
 
 // extractLiteralValue extracts the literal value from an expression or returns it as-is.
@@ -427,7 +571,7 @@ func NewDynamoDBPartiQLDriver(fields []FieldInfo) *DynamoDBPartiQLDriver {
 // RenderPartiQL renders the expression to DynamoDB PartiQL with AttributeValue parameters.
 func (d *DynamoDBPartiQLDriver) RenderPartiQL(e *expr.Expression) (string, []types.AttributeValue, error) {
 	// Use base rendering with ? placeholders
-	str, params, err := d.Base.RenderParam(e)
+	str, params, err := d.RenderParam(e)
 	if err != nil {
 		return "", nil, err
 	}

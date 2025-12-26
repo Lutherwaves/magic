@@ -1,6 +1,7 @@
 package lucene
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -354,12 +355,12 @@ func TestComplexQueries(t *testing.T) {
 	}
 }
 
-// TestImplicitSearch tests implicit search across default fields
+// TestImplicitSearch tests implicit search across fields with ImplicitSearch=true
 func TestImplicitSearch(t *testing.T) {
 	fields := []FieldInfo{
-		{Name: "name", IsJSONB: false, IsDefault: true},
-		{Name: "email", IsJSONB: false, IsDefault: true},
-		{Name: "description", IsJSONB: false, IsDefault: true},
+		{Name: "name", IsJSONB: false, ImplicitSearch: true},
+		{Name: "email", IsJSONB: false, ImplicitSearch: true},
+		{Name: "description", IsJSONB: false, ImplicitSearch: true},
 	}
 	parser := NewParser(fields)
 
@@ -456,6 +457,239 @@ func TestMapOutput(t *testing.T) {
 	}
 }
 
+// TestFieldValidation tests field validation for invalid field references
+func TestFieldValidation(t *testing.T) {
+	fields := []FieldInfo{
+		{Name: "name", IsJSONB: false, ImplicitSearch: true},
+		{Name: "description", IsJSONB: false, ImplicitSearch: true},
+		{Name: "status", IsJSONB: false},
+		{Name: "labels", IsJSONB: true},
+		{Name: "metadata", IsJSONB: true},
+	}
+	parser := NewParser(fields)
+
+	tests := []struct {
+		name     string
+		query    string
+		wantErr  bool
+		errField string
+	}{
+		{
+			name:    "valid field query",
+			query:   "name:john",
+			wantErr: false,
+		},
+		{
+			name:    "valid JSONB sub-field",
+			query:   "labels.category:urgent",
+			wantErr: false,
+		},
+		{
+			name:     "invalid field",
+			query:    "nonexistent:value",
+			wantErr:  true,
+			errField: "nonexistent",
+		},
+		{
+			name:     "invalid JSONB base field",
+			query:    "fakejsonb.key:value",
+			wantErr:  true,
+			errField: "fakejsonb.key",
+		},
+		{
+			name:     "sub-field on non-JSONB field",
+			query:    "name.subfield:value",
+			wantErr:  true,
+			errField: "name.subfield",
+		},
+		{
+			name:    "implicit search (no explicit fields) - valid",
+			query:   "paint",
+			wantErr: false,
+		},
+		{
+			name:    "mixed valid and implicit",
+			query:   "status:active AND paint",
+			wantErr: false,
+		},
+		{
+			name:     "mixed valid and invalid",
+			query:    "name:john AND invalid_field:test",
+			wantErr:  true,
+			errField: "invalid_field",
+		},
+		{
+			name:    "complex valid query",
+			query:   "(name:john OR description:test) AND status:active AND labels.priority:high",
+			wantErr: false,
+		},
+		{
+			name:     "invalid field in complex query",
+			query:    "(name:john OR badfield:test) AND status:active",
+			wantErr:  true,
+			errField: "badfield",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := parser.ParseToSQL(tt.query)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("ParseToSQL() expected error for query %q but got none", tt.query)
+					return
+				}
+				if _, ok := err.(*InvalidFieldError); !ok {
+					t.Errorf("ParseToSQL() error = %v, want InvalidFieldError", err)
+					return
+				}
+				if !strings.Contains(err.Error(), tt.errField) {
+					t.Errorf("ParseToSQL() error = %v, want to mention field %q", err, tt.errField)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("ParseToSQL() unexpected error = %v for query %q", err, tt.query)
+				}
+			}
+		})
+	}
+}
+
+// TestValidateFields tests the ValidateFields method directly
+func TestValidateFields(t *testing.T) {
+	fields := []FieldInfo{
+		{Name: "id", IsJSONB: false},
+		{Name: "tenant_id", IsJSONB: false},
+		{Name: "name", IsJSONB: false, ImplicitSearch: true},
+		{Name: "description", IsJSONB: false, ImplicitSearch: true},
+		{Name: "status", IsJSONB: false},
+		{Name: "labels", IsJSONB: true},
+		{Name: "properties", IsJSONB: true},
+		{Name: "metadata", IsJSONB: true},
+	}
+	parser := NewParser(fields)
+
+	tests := []struct {
+		name    string
+		query   string
+		wantErr bool
+	}{
+		{"valid simple field", "name:test", false},
+		{"valid multiple fields", "name:test AND status:active", false},
+		{"valid JSONB sub-field", "labels.category:urgent", false},
+		{"valid deep JSONB", "metadata.nested_key:value", false},
+		{"invalid field", "unknown_field:test", true},
+		{"invalid JSONB base", "unknown.subkey:test", true},
+		{"sub-field on non-JSONB", "status.sub:test", true},
+		{"empty query", "", false},
+		{"implicit only - no field prefix", "searchterm", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := parser.ValidateFields(tt.query)
+			if tt.wantErr && err == nil {
+				t.Errorf("ValidateFields(%q) expected error but got none", tt.query)
+			}
+			if !tt.wantErr && err != nil {
+				t.Errorf("ValidateFields(%q) unexpected error: %v", tt.query, err)
+			}
+		})
+	}
+}
+
+// TestNilValueQueries tests nil/null value handling for IS NULL queries
+func TestNilValueQueries(t *testing.T) {
+	fields := []FieldInfo{
+		{Name: "name", IsJSONB: false},
+		{Name: "parent_id", IsJSONB: false},
+		{Name: "deleted_at", IsJSONB: false},
+		{Name: "attachment_ids", IsJSONB: false},
+	}
+	parser := NewParser(fields)
+
+	tests := []struct {
+		name    string
+		query   string
+		wantSQL string
+		wantErr bool
+	}{
+		{
+			name:    "field is nil",
+			query:   "deleted_at:nil",
+			wantSQL: "IS NULL",
+		},
+		{
+			name:    "field is null (lowercase)",
+			query:   "deleted_at:null",
+			wantSQL: "IS NULL",
+		},
+		{
+			name:    "field is NULL (uppercase)",
+			query:   "deleted_at:NULL",
+			wantSQL: "IS NULL",
+		},
+		{
+			name:    "parent_id is nil",
+			query:   "parent_id:nil",
+			wantSQL: "IS NULL",
+		},
+		{
+			name:    "combined nil with other conditions",
+			query:   "deleted_at:nil AND name:john",
+			wantSQL: "IS NULL",
+		},
+		{
+			name:    "NOT nil (is not null)",
+			query:   "NOT deleted_at:nil",
+			wantSQL: "NOT",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sql, _, err := parser.ParseToSQL(tt.query)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("ParseToSQL(%q) expected error but got none", tt.query)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseToSQL(%q) error = %v", tt.query, err)
+			}
+			if !strings.Contains(sql, tt.wantSQL) {
+				t.Errorf("ParseToSQL(%q) sql = %v, want to contain %v", tt.query, sql, tt.wantSQL)
+			}
+		})
+	}
+}
+
+// TestEmptyAsLiteralValue tests that 'empty' is treated as a literal value (not special keyword)
+func TestEmptyAsLiteralValue(t *testing.T) {
+	fields := []FieldInfo{
+		{Name: "status", IsJSONB: false},
+		{Name: "name", IsJSONB: false},
+	}
+	parser := NewParser(fields)
+
+	// 'empty' should be treated as a regular search value, not a special keyword
+	sql, params, err := parser.ParseToSQL("status:empty")
+	if err != nil {
+		t.Fatalf("ParseToSQL() error = %v", err)
+	}
+
+	// Should generate a regular equals query, not IS NULL
+	if strings.Contains(sql, "IS NULL") {
+		t.Errorf("'empty' should be treated as literal value, not IS NULL. Got: %s", sql)
+	}
+
+	// The value should be in params
+	if len(params) != 1 || params[0] != "empty" {
+		t.Errorf("Expected params to contain 'empty', got: %v", params)
+	}
+}
+
 // BenchmarkParser benchmarks the parser performance
 func BenchmarkParser(b *testing.B) {
 	fields := []FieldInfo{
@@ -471,5 +705,168 @@ func BenchmarkParser(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_, _, _ = parser.ParseToSQL(query)
+	}
+}
+
+// TestFuzzySearch tests fuzzy search operator (~) using pg_trgm similarity
+func TestFuzzySearch(t *testing.T) {
+	fields := []FieldInfo{
+		{Name: "name", IsJSONB: false},
+		{Name: "description", IsJSONB: false},
+		{Name: "status", IsJSONB: false},
+		{Name: "labels", IsJSONB: true},
+	}
+	parser := NewParser(fields)
+
+	tests := []struct {
+		name    string
+		query   string
+		wantSQL string
+		wantErr bool
+	}{
+		{
+			name:    "basic fuzzy search",
+			query:   "name:roam~",
+			wantSQL: "similarity",
+		},
+		{
+			name:    "fuzzy with distance",
+			query:   "name:roam~2",
+			wantSQL: "similarity",
+		},
+		{
+			name:    "fuzzy on JSONB field",
+			query:   "labels.category:construction~",
+			wantSQL: "similarity",
+		},
+		{
+			name:    "fuzzy combined with other conditions",
+			query:   "name:roam~ AND status:active",
+			wantSQL: "similarity",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sql, params, err := parser.ParseToSQL(tt.query)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("ParseToSQL(%q) expected error but got none", tt.query)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseToSQL(%q) error = %v", tt.query, err)
+			}
+			if !strings.Contains(sql, tt.wantSQL) {
+				t.Errorf("ParseToSQL(%q) sql = %v, want to contain %v", tt.query, sql, tt.wantSQL)
+			}
+			if len(params) == 0 {
+				t.Errorf("ParseToSQL(%q) expected at least one parameter", tt.query)
+			}
+		})
+	}
+}
+
+// TestEscaping tests that special characters can be escaped in queries
+func TestEscaping(t *testing.T) {
+	fields := []FieldInfo{
+		{Name: "name", IsJSONB: false},
+		{Name: "version", IsJSONB: false},
+		{Name: "path", IsJSONB: false},
+	}
+	parser := NewParser(fields)
+
+	tests := []struct {
+		name    string
+		query   string
+		wantSQL string
+		wantErr bool
+	}{
+		{
+			name:    "escaped plus sign",
+			query:   `name:C\+\+`,
+			wantSQL: `"name"`,
+		},
+		{
+			name:    "escaped colon",
+			query:   `version:1\.2\.3`,
+			wantSQL: `"version"`,
+		},
+		{
+			name:    "escaped parentheses",
+			query:   `name:\(test\)`,
+			wantSQL: `"name"`,
+		},
+		{
+			name:    "escaped path separator",
+			query:   `path:src\/components`,
+			wantSQL: `"path"`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sql, params, err := parser.ParseToSQL(tt.query)
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("ParseToSQL(%q) expected error but got none", tt.query)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseToSQL(%q) error = %v", tt.query, err)
+			}
+			if !strings.Contains(sql, tt.wantSQL) {
+				t.Errorf("ParseToSQL(%q) sql = %v, want to contain %v", tt.query, sql, tt.wantSQL)
+			}
+			// Verify the escaped character is in the parameter
+			if len(params) > 0 {
+				paramStr := fmt.Sprintf("%v", params[0])
+				// The escaped character should appear as the literal character in params
+				if strings.Contains(tt.query, `\+`) && !strings.Contains(paramStr, "+") {
+					t.Errorf("ParseToSQL(%q) expected '+' in params, got %v", tt.query, params)
+				}
+			}
+		})
+	}
+}
+
+// TestBoostOperatorError tests that boost operator returns a clear error
+func TestBoostOperatorError(t *testing.T) {
+	fields := []FieldInfo{
+		{Name: "name", IsJSONB: false},
+		{Name: "status", IsJSONB: false},
+	}
+	parser := NewParser(fields)
+
+	tests := []struct {
+		name    string
+		query   string
+		wantErr string
+	}{
+		{
+			name:    "boost operator",
+			query:   "name:test^4",
+			wantErr: "boost operator",
+		},
+		{
+			name:    "boost in compound query",
+			query:   "name:test^2 AND status:active",
+			wantErr: "boost operator",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := parser.ParseToSQL(tt.query)
+			if err == nil {
+				t.Errorf("ParseToSQL(%q) expected error but got none", tt.query)
+				return
+			}
+			if !strings.Contains(strings.ToLower(err.Error()), strings.ToLower(tt.wantErr)) {
+				t.Errorf("ParseToSQL(%q) error = %v, want to contain %v", tt.query, err, tt.wantErr)
+			}
+		})
 	}
 }

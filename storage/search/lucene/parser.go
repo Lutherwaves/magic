@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log/slog"
 	"reflect"
+	"regexp"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
@@ -11,7 +12,7 @@ import (
 	"github.com/grindlemire/go-lucene/pkg/lucene/expr"
 )
 
-// Safety limits for query parsing (OWASP A04: Insecure Design - DoS prevention)
+// Safety limits for query parsing
 const (
 	DefaultMaxQueryLength = 10000 // 10KB - prevents memory exhaustion
 	DefaultMaxDepth       = 20    // Prevents stack overflow from deep nesting
@@ -20,19 +21,23 @@ const (
 
 // FieldInfo describes a searchable field and its properties.
 type FieldInfo struct {
-	Name      string
-	IsJSONB   bool
-	IsDefault bool // Whether this field is searched in implicit queries (no field prefix)
+	Name           string
+	IsJSONB        bool
+	ImplicitSearch bool // Whether this field is included in unfielded/implicit queries
 }
 
 // Parser provides Lucene query parsing with security limits.
 type Parser struct {
-	DefaultFields []FieldInfo
+	Fields []FieldInfo // All searchable fields
 
 	// Security limits (configurable with safe defaults)
 	MaxQueryLength int // Maximum query string length (default: 10KB)
 	MaxDepth       int // Maximum nesting depth (default: 20)
 	MaxTerms       int // Maximum number of terms (default: 100)
+
+	// Field lookup maps for O(1) validation
+	fieldMap    map[string]FieldInfo // All fields by name
+	jsonbFields map[string]bool      // JSONB field names for sub-field validation
 
 	// Custom drivers for different backends
 	postgresDriver *PostgresJSONBDriver
@@ -45,30 +50,30 @@ type Parser struct {
 // - Zero database overhead
 // - Compile-time safety
 // - Auto-detects JSONB fields from gorm tags
-// - Auto-sets string fields as searchable (IsDefault=true)
+// - Auto-sets string fields for implicit search (ImplicitSearch=true)
 //
 // Example:
 //
 //	type Task struct {
 //	    ID          string    `json:"id"`
-//	    Name        string    `json:"name"`                         // Auto: IsDefault=true
-//	    Description string    `json:"description"`                  // Auto: IsDefault=true
-//	    Status      string    `json:"status" lucene:"nodefault"`    // Explicit: IsDefault=false
-//	    CreatedAt   time.Time `json:"created_at"`                   // Auto: IsDefault=false (not string)
-//	    Labels      JSONB     `json:"labels" gorm:"type:jsonb"`     // Auto: IsJSONB=true, IsDefault=false
+//	    Name        string    `json:"name"`                         // Auto: ImplicitSearch=true
+//	    Description string    `json:"description"`                  // Auto: ImplicitSearch=true
+//	    Status      string    `json:"status" lucene:"explicit"`     // Explicit: ImplicitSearch=false
+//	    CreatedAt   time.Time `json:"created_at"`                   // Auto: ImplicitSearch=false (not string)
+//	    Labels      JSONB     `json:"labels" gorm:"type:jsonb"`     // Auto: IsJSONB=true, ImplicitSearch=false
 //	}
 //
 //	parser, err := lucene.NewParserFromType(Task{})
 //
 // Struct tag controls:
-// - lucene:"default"   - Force IsDefault=true (include in implicit search)
-// - lucene:"nodefault" - Force IsDefault=false (require explicit field prefix)
-// - gorm:"type:jsonb"  - Auto-detected as JSONB field
+// - lucene:"implicit" - Force ImplicitSearch=true (include in unfielded queries)
+// - lucene:"explicit" - Force ImplicitSearch=false (require field:value syntax)
+// - gorm:"type:jsonb" - Auto-detected as JSONB field
 //
 // Auto-detection rules (when no lucene tag):
-// - String fields: IsDefault=true (searchable in implicit queries)
-// - Non-string fields (int, time.Time, uuid, etc.): IsDefault=false
-// - JSONB fields: IsDefault=false (require field.subfield syntax)
+// - String fields: ImplicitSearch=true (included in unfielded queries)
+// - Non-string fields (int, time.Time, uuid, etc.): ImplicitSearch=false
+// - JSONB fields: ImplicitSearch=false (require field.subfield syntax)
 func NewParserFromType(model any) (*Parser, error) {
 	fields, err := getStructFields(model)
 	if err != nil {
@@ -77,20 +82,54 @@ func NewParserFromType(model any) (*Parser, error) {
 	return NewParser(fields), nil
 }
 
-// NewParser creates a new Lucene query parser with the given default fields.
-func NewParser(defaultFields []FieldInfo) *Parser {
+// NewParser creates a new Lucene query parser with the given fields.
+func NewParser(fields []FieldInfo) *Parser {
+	// Build field lookup maps for O(1) validation
+	fieldMap := make(map[string]FieldInfo, len(fields))
+	jsonbFields := make(map[string]bool)
+	for _, f := range fields {
+		fieldMap[f.Name] = f
+		if f.IsJSONB {
+			jsonbFields[f.Name] = true
+		}
+	}
+
 	return &Parser{
-		DefaultFields:  defaultFields,
+		Fields:         fields,
 		MaxQueryLength: DefaultMaxQueryLength,
 		MaxDepth:       DefaultMaxDepth,
 		MaxTerms:       DefaultMaxTerms,
-		postgresDriver: NewPostgresJSONBDriver(defaultFields),
-		dynamoDriver:   NewDynamoDBPartiQLDriver(defaultFields),
+		fieldMap:       fieldMap,
+		jsonbFields:    jsonbFields,
+		postgresDriver: NewPostgresJSONBDriver(fields),
+		dynamoDriver:   NewDynamoDBPartiQLDriver(fields),
 	}
 }
 
+// Precompiled regex for performance - matches Lucene operators and special syntax
+var (
+	// Matches field:value pattern (including JSONB like labels.category:value)
+	fieldValuePattern = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)?:`)
+	// Extracts field name from field:value pattern
+	fieldExtractPattern = regexp.MustCompile(`([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)?):`)
+	// Matches boolean operators (case-insensitive)
+	booleanOperators = regexp.MustCompile(`(?i)^(AND|OR|NOT|\+|-)$`)
+	// Matches range syntax
+	rangePattern = regexp.MustCompile(`^\[.*\s+TO\s+.*\]$|^\{.*\s+TO\s+.*\}$`)
+)
+
+// InvalidFieldError represents an error when a query references a non-existent field
+type InvalidFieldError struct {
+	Field       string
+	ValidFields []string
+}
+
+func (e *InvalidFieldError) Error() string {
+	return fmt.Sprintf("invalid field '%s' in query; valid fields are: %s", e.Field, strings.Join(e.ValidFields, ", "))
+}
+
 // getStructFields extracts field information from a struct using reflection.
-// It sets IsDefault=true for string fields (text-like) and IsDefault=false for
+// It sets ImplicitSearch=true for string fields (text-like) and ImplicitSearch=false for
 // other types (int, time, uuid, etc.) following the same logic as schema introspection.
 func getStructFields(model any) ([]FieldInfo, error) {
 	t := reflect.TypeOf(model)
@@ -117,20 +156,20 @@ func getStructFields(model any) ([]FieldInfo, error) {
 		gormTag := field.Tag.Get("gorm")
 		isJSONB := strings.Contains(gormTag, "type:jsonb")
 
-		// Check if the lucene tag explicitly sets isDefault
+		// Check if the lucene tag explicitly sets implicit search behavior
 		luceneTag := field.Tag.Get("lucene")
-		isDefault := false
-		if luceneTag == "default" {
-			isDefault = true
-		} else if luceneTag != "nodefault" {
-			// Auto-detect: string types are default, others are not
-			isDefault = field.Type.Kind() == reflect.String && !isJSONB
+		implicitSearch := false
+		if luceneTag == "implicit" {
+			implicitSearch = true
+		} else if luceneTag != "explicit" {
+			// Auto-detect: string types are implicit, others require explicit field:value
+			implicitSearch = field.Type.Kind() == reflect.String && !isJSONB
 		}
 
 		fields = append(fields, FieldInfo{
-			Name:      jsonTag,
-			IsJSONB:   isJSONB,
-			IsDefault: isDefault,
+			Name:           jsonTag,
+			IsJSONB:        isJSONB,
+			ImplicitSearch: implicitSearch,
 		})
 	}
 
@@ -140,13 +179,12 @@ func getStructFields(model any) ([]FieldInfo, error) {
 // ParseToMap parses a Lucene query into a map representation.
 // Note: This is a legacy method kept for backward compatibility.
 func (p *Parser) ParseToMap(query string) (map[string]any, error) {
-	// Security: Validate query length (OWASP A04: DoS prevention)
+
 	if err := p.validateQuery(query); err != nil {
 		return nil, err
 	}
 
-	// Parse using the library
-	e, err := p.parseWithDefaults(query)
+	e, err := p.parseWithImplicitSearch(query)
 	if err != nil {
 		return nil, err
 	}
@@ -159,13 +197,20 @@ func (p *Parser) ParseToMap(query string) (map[string]any, error) {
 func (p *Parser) ParseToSQL(query string) (string, []any, error) {
 	slog.Debug(fmt.Sprintf(`Parsing query to SQL: %s`, query))
 
-	// Security: Validate query length (OWASP A04: DoS prevention)
 	if err := p.validateQuery(query); err != nil {
 		return "", nil, err
 	}
 
+	// Expand implicit terms first (for validation of the full query)
+	expandedQuery := p.expandImplicitTerms(query)
+
+	// Validate all field references exist in the model
+	if err := p.ValidateFields(expandedQuery); err != nil {
+		return "", nil, err
+	}
+
 	// Parse using the library
-	e, err := p.parseWithDefaults(query)
+	e, err := p.parseWithImplicitSearch(query)
 	if err != nil {
 		return "", nil, err
 	}
@@ -183,13 +228,20 @@ func (p *Parser) ParseToSQL(query string) (string, []any, error) {
 func (p *Parser) ParseToDynamoDBPartiQL(query string) (string, []types.AttributeValue, error) {
 	slog.Debug(fmt.Sprintf(`Parsing query to DynamoDB PartiQL: %s`, query))
 
-	// Security: Validate query length (OWASP A04: DoS prevention)
 	if err := p.validateQuery(query); err != nil {
 		return "", nil, err
 	}
 
+	// Expand implicit terms first (for validation of the full query)
+	expandedQuery := p.expandImplicitTerms(query)
+
+	// Validate all field references exist in the model
+	if err := p.ValidateFields(expandedQuery); err != nil {
+		return "", nil, err
+	}
+
 	// Parse using the library
-	e, err := p.parseWithDefaults(query)
+	e, err := p.parseWithImplicitSearch(query)
 	if err != nil {
 		return "", nil, err
 	}
@@ -208,67 +260,477 @@ func (p *Parser) validateQuery(query string) error {
 	if len(query) > p.MaxQueryLength {
 		return fmt.Errorf("query too long: %d bytes exceeds maximum of %d bytes", len(query), p.MaxQueryLength)
 	}
+
+	depth := calculateNestingDepth(query)
+	if depth > p.MaxDepth {
+		return fmt.Errorf("query too complex: nesting depth %d exceeds maximum of %d", depth, p.MaxDepth)
+	}
+
+	terms := countTerms(query)
+	if terms > p.MaxTerms {
+		return fmt.Errorf("query too large: %d terms exceeds maximum of %d", terms, p.MaxTerms)
+	}
+
 	return nil
 }
 
-// parseWithDefaults parses a query with multi-field default support.
-// If the query contains unfielded terms, it expands them across all default fields with OR.
-func (p *Parser) parseWithDefaults(query string) (*expr.Expression, error) {
+// calculateNestingDepth calculates the maximum nesting depth of parentheses and brackets.
+func calculateNestingDepth(query string) int {
+	maxDepth := 0
+	currentDepth := 0
+	inQuotes := false
+
+	for i := 0; i < len(query); i++ {
+		c := query[i]
+
+		// Handle escaped characters
+		if c == '\\' && i+1 < len(query) {
+			i++ // Skip the escaped character
+			continue
+		}
+
+		// Handle quotes
+		if c == '"' {
+			inQuotes = !inQuotes
+			continue
+		}
+
+		// Only count nesting when not in quotes
+		if !inQuotes {
+			switch c {
+			case '(', '[', '{':
+				currentDepth++
+				if currentDepth > maxDepth {
+					maxDepth = currentDepth
+				}
+			case ')', ']', '}':
+				currentDepth--
+			}
+		}
+	}
+
+	return maxDepth
+}
+
+// countTerms counts the number of search terms in a query.
+// A term is a field:value pair, an implicit search term, or a quoted phrase.
+// Operators (AND, OR, NOT) and parentheses are not counted as terms.
+func countTerms(query string) int {
+	if query == "" {
+		return 0
+	}
+
+	terms := 0
+	inQuotes := false
+	inRange := false
+	currentTerm := false
+
+	for i := 0; i < len(query); i++ {
+		c := query[i]
+
+		// Handle escaped characters
+		if c == '\\' && i+1 < len(query) {
+			i++ // Skip the escaped character
+			currentTerm = true
+			continue
+		}
+
+		// Handle quotes
+		if c == '"' {
+			if !inQuotes {
+				// Start of quoted term
+				if currentTerm {
+					terms++
+				}
+				currentTerm = true
+			} else {
+				// End of quoted term
+				if currentTerm {
+					terms++
+					currentTerm = false
+				}
+			}
+			inQuotes = !inQuotes
+			continue
+		}
+
+		// Handle range brackets
+		if !inQuotes {
+			if c == '[' || c == '{' {
+				inRange = true
+				if currentTerm {
+					terms++
+					currentTerm = false
+				}
+				continue
+			}
+			if c == ']' || c == '}' {
+				inRange = false
+				if currentTerm {
+					terms++
+					currentTerm = false
+				}
+				continue
+			}
+		}
+
+		// Handle spaces (term separators) when not in quotes or range
+		if c == ' ' && !inQuotes && !inRange {
+			if currentTerm {
+				terms++
+				currentTerm = false
+			}
+			continue
+		}
+
+		// Handle parentheses - don't count as terms
+		if !inQuotes && !inRange && (c == '(' || c == ')') {
+			if currentTerm {
+				terms++
+				currentTerm = false
+			}
+			continue
+		}
+
+		// Handle operators (AND, OR, NOT) - they don't count as terms
+		if !inQuotes && !inRange && currentTerm {
+			remaining := query[i:]
+			if strings.HasPrefix(remaining, "AND ") || strings.HasPrefix(remaining, "OR ") ||
+				strings.HasPrefix(remaining, "NOT ") || strings.HasPrefix(remaining, "and ") ||
+				strings.HasPrefix(remaining, "or ") || strings.HasPrefix(remaining, "not ") {
+				// End current term before operator
+				terms++
+				currentTerm = false
+				// Skip the operator
+				if len(remaining) >= 3 && (remaining[0] == 'A' || remaining[0] == 'a') {
+					i += 3 // AND
+				} else if len(remaining) >= 3 && (remaining[0] == 'N' || remaining[0] == 'n') {
+					i += 3 // NOT
+				} else {
+					i += 2 // OR
+				}
+				continue
+			}
+		}
+
+		// Any other character is part of a term
+		currentTerm = true
+	}
+
+	// Count the last term if present
+	if currentTerm {
+		terms++
+	}
+
+	return terms
+}
+
+// ValidateFields extracts all field references from a query and validates they exist in the model.
+// Returns InvalidFieldError if any field is not found.
+func (p *Parser) ValidateFields(query string) error {
+	// Extract all field:value patterns from the query
+	matches := fieldExtractPattern.FindAllStringSubmatchIndex(query, -1)
+	if len(matches) == 0 {
+		return nil // No explicit fields to validate
+	}
+
+	// Collect all valid field names for error message
+	validFields := p.getValidFieldNames()
+
+	for _, match := range matches {
+		if len(match) < 4 {
+			continue
+		}
+		// match[0] = full match start, match[1] = full match end
+		// match[2] = first group start, match[3] = first group end
+		fieldStart := match[2]
+		fieldEnd := match[3]
+
+		// Skip if this match is inside a quoted string
+		if isInsideQuotes(query, fieldStart) {
+			continue
+		}
+
+		fieldName := query[fieldStart:fieldEnd]
+
+		if err := p.validateFieldName(fieldName); err != nil {
+			return &InvalidFieldError{
+				Field:       fieldName,
+				ValidFields: validFields,
+			}
+		}
+	}
+
+	return nil
+}
+
+// isInsideQuotes checks if a position in the query string is inside a quoted string.
+func isInsideQuotes(query string, pos int) bool {
+	inQuotes := false
+	for i := 0; i < pos && i < len(query); i++ {
+		c := query[i]
+		// Handle escaped characters
+		if c == '\\' && i+1 < len(query) {
+			i++ // Skip the escaped character
+			continue
+		}
+		// Toggle quote state
+		if c == '"' {
+			inQuotes = !inQuotes
+		}
+	}
+	return inQuotes
+}
+
+// validateFieldName checks if a field name is valid.
+// Handles both simple fields (e.g., "name") and JSONB sub-fields (e.g., "labels.category")
+func (p *Parser) validateFieldName(fieldName string) error {
+	// Check for JSONB sub-field notation (e.g., "labels.category")
+	if strings.Contains(fieldName, ".") {
+		parts := strings.SplitN(fieldName, ".", 2)
+		if len(parts) != 2 {
+			return fmt.Errorf("invalid field format: %s", fieldName)
+		}
+
+		baseField := parts[0]
+
+		// Check if base field exists and is JSONB
+		if !p.jsonbFields[baseField] {
+			if _, exists := p.fieldMap[baseField]; !exists {
+				return fmt.Errorf("field '%s' does not exist", baseField)
+			}
+			return fmt.Errorf("field '%s' is not a JSONB field; cannot use sub-field notation", baseField)
+		}
+
+		// JSONB sub-fields are allowed (any sub-field name is valid for JSONB)
+		return nil
+	}
+
+	// Check if field exists
+	if _, exists := p.fieldMap[fieldName]; !exists {
+		return fmt.Errorf("field '%s' does not exist", fieldName)
+	}
+
+	return nil
+}
+
+// getValidFieldNames returns a list of valid field names for error messages
+func (p *Parser) getValidFieldNames() []string {
+	var names []string
+	for _, f := range p.Fields {
+		if f.IsJSONB {
+			names = append(names, f.Name+".*")
+		} else {
+			names = append(names, f.Name)
+		}
+	}
+	return names
+}
+
+// getImplicitSearchFields returns all fields marked for implicit search (ImplicitSearch=true)
+func (p *Parser) getImplicitSearchFields() []FieldInfo {
+	var fields []FieldInfo
+	for _, field := range p.Fields {
+		if field.ImplicitSearch {
+			fields = append(fields, field)
+		}
+	}
+	return fields
+}
+
+// isImplicitTerm checks if a token is an implicit search term (not a field:value, operator, or range)
+func isImplicitTerm(token string) bool {
+	token = strings.TrimSpace(token)
+	if token == "" {
+		return false
+	}
+
+	// Check if it's a boolean operator
+	if booleanOperators.MatchString(token) {
+		return false
+	}
+
+	// Check if it starts with + or - (required/prohibited operators)
+	if strings.HasPrefix(token, "+") || strings.HasPrefix(token, "-") {
+		// Remove the prefix and check the rest
+		rest := token[1:]
+		if fieldValuePattern.MatchString(rest) {
+			return false // It's a +field:value or -field:value
+		}
+		// Otherwise it's an implicit term with +/- modifier
+		return true
+	}
+
+	// Check if it's a field:value pattern
+	if fieldValuePattern.MatchString(token) {
+		return false
+	}
+
+	// Check if it's a range query
+	if rangePattern.MatchString(token) {
+		return false
+	}
+
+	// Check if it's a parenthesis
+	if token == "(" || token == ")" {
+		return false
+	}
+
+	// Quoted strings are also implicit terms (they search across implicit search fields)
+	if strings.HasPrefix(token, `"`) && strings.HasSuffix(token, `"`) {
+		return true
+	}
+
+	return true
+}
+
+// expandImplicitTerms expands implicit search terms to explicit field:value patterns
+// across all implicit search fields. For example:
+// "paint" → "(name:*paint* OR description:*paint*)"
+// "paint*" → "(name:paint* OR description:paint*)"
+// '"Living Room"' → '(name:"Living Room" OR description:"Living Room")'
+func (p *Parser) expandImplicitTerms(query string) string {
+	implicitFields := p.getImplicitSearchFields()
+	if len(implicitFields) == 0 {
+		return query
+	}
+
+	// Tokenize the query while preserving structure
+	tokens := tokenizeQuery(query)
+	var result []string
+
+	for _, token := range tokens {
+		if isImplicitTerm(token) {
+			// Check if it has a +/- prefix
+			prefix := ""
+			term := token
+			if strings.HasPrefix(token, "+") || strings.HasPrefix(token, "-") {
+				prefix = string(token[0])
+				term = token[1:]
+			}
+
+			// Check if it's a quoted phrase (exact match) or already has wildcards
+			searchTerm := term
+			isQuotedPhrase := strings.HasPrefix(term, `"`) && strings.HasSuffix(term, `"`)
+			hasWildcards := strings.Contains(term, "*") || strings.Contains(term, "?")
+
+			// For implicit search without wildcards or quotes, use contains matching
+			// This provides a better user experience for simple searches
+			if !isQuotedPhrase && !hasWildcards {
+				searchTerm = "*" + term + "*"
+			}
+
+			// Expand to all implicit search fields with OR
+			var fieldTerms []string
+			for _, field := range implicitFields {
+				fieldTerms = append(fieldTerms, fmt.Sprintf("%s:%s", field.Name, searchTerm))
+			}
+
+			if len(fieldTerms) == 1 {
+				result = append(result, prefix+fieldTerms[0])
+			} else {
+				expanded := "(" + strings.Join(fieldTerms, " OR ") + ")"
+				if prefix != "" {
+					expanded = prefix + expanded
+				}
+				result = append(result, expanded)
+			}
+		} else {
+			result = append(result, token)
+		}
+	}
+
+	return strings.Join(result, " ")
+}
+
+// tokenizeQuery splits a Lucene query into tokens while preserving quoted strings and ranges
+func tokenizeQuery(query string) []string {
+	var tokens []string
+	var current strings.Builder
+	inQuotes := false
+	inRange := false
+	rangeDepth := 0
+
+	for i := 0; i < len(query); i++ {
+		c := query[i]
+
+		// Handle quotes
+		if c == '"' && (i == 0 || query[i-1] != '\\') {
+			inQuotes = !inQuotes
+			current.WriteByte(c)
+			continue
+		}
+
+		// Handle range brackets
+		if !inQuotes {
+			if c == '[' || c == '{' {
+				inRange = true
+				rangeDepth++
+				current.WriteByte(c)
+				continue
+			}
+			if c == ']' || c == '}' {
+				current.WriteByte(c)
+				rangeDepth--
+				if rangeDepth == 0 {
+					inRange = false
+				}
+				continue
+			}
+		}
+
+		// Handle spaces (token separators) when not in quotes or range
+		if c == ' ' && !inQuotes && !inRange {
+			if current.Len() > 0 {
+				tokens = append(tokens, current.String())
+				current.Reset()
+			}
+			continue
+		}
+
+		// Handle parentheses as separate tokens
+		if !inQuotes && !inRange && (c == '(' || c == ')') {
+			if current.Len() > 0 {
+				tokens = append(tokens, current.String())
+				current.Reset()
+			}
+			tokens = append(tokens, string(c))
+			continue
+		}
+
+		current.WriteByte(c)
+	}
+
+	if current.Len() > 0 {
+		tokens = append(tokens, current.String())
+	}
+
+	return tokens
+}
+
+// parseWithImplicitSearch parses a query with implicit search support.
+// If the query contains unfielded terms, it expands them across all implicit search fields with OR.
+func (p *Parser) parseWithImplicitSearch(query string) (*expr.Expression, error) {
 	query = strings.TrimSpace(query)
 	if query == "" {
 		return nil, nil
 	}
 
-	// Check if query has any explicit field:value patterns
-	hasExplicitFields := strings.Contains(query, ":")
+	// Expand implicit terms to explicit field:value patterns
+	expandedQuery := p.expandImplicitTerms(query)
 
-	// Get fields marked for implicit search (IsDefault = true)
-	var implicitSearchFields []FieldInfo
-	for _, field := range p.DefaultFields {
-		if field.IsDefault {
-			implicitSearchFields = append(implicitSearchFields, field)
-		}
+	slog.Debug("Query expansion", "original", query, "expanded", expandedQuery)
+
+	// Get first implicit field as fallback for the parser
+	fallbackField := ""
+	implicitFields := p.getImplicitSearchFields()
+	if len(implicitFields) > 0 {
+		fallbackField = implicitFields[0].Name
+	} else if len(p.Fields) > 0 {
+		fallbackField = p.Fields[0].Name
 	}
 
-	// If there are explicit fields, just parse normally with the first default field as fallback
-	if hasExplicitFields {
-		defaultField := ""
-		if len(implicitSearchFields) > 0 {
-			defaultField = implicitSearchFields[0].Name
-		} else if len(p.DefaultFields) > 0 {
-			defaultField = p.DefaultFields[0].Name
-		}
-		return lucene.Parse(query, lucene.WithDefaultField(defaultField))
-	}
-
-	// Query has no explicit fields - create OR across all IsDefault=true fields
-	if len(implicitSearchFields) == 0 {
-		return nil, fmt.Errorf("no default fields configured for implicit search")
-	}
-
-	// For simple queries without fields, expand to: (field1:query OR field2:query OR ...)
-	var orExpressions []*expr.Expression
-	for _, field := range implicitSearchFields {
-		// Parse with this specific field as default
-		e, err := lucene.Parse(query, lucene.WithDefaultField(field.Name))
-		if err != nil {
-			return nil, err
-		}
-		orExpressions = append(orExpressions, e)
-	}
-
-	// Combine all expressions with OR
-	if len(orExpressions) == 1 {
-		return orExpressions[0], nil
-	}
-
-	// Build OR tree
-	result := orExpressions[0]
-	for i := 1; i < len(orExpressions); i++ {
-		result = expr.Expr(result, expr.Or, orExpressions[i])
-	}
-
-	return result, nil
+	return lucene.Parse(expandedQuery, lucene.WithDefaultField(fallbackField))
 }
 
 // exprToMap converts an expression to a map representation (legacy format).
