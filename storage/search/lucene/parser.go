@@ -82,9 +82,7 @@ func NewParserFromType(model any) (*Parser, error) {
 	return NewParser(fields), nil
 }
 
-// NewParser creates a new Lucene query parser with the given fields.
 func NewParser(fields []FieldInfo) *Parser {
-	// Build field lookup maps for O(1) validation
 	fieldMap := make(map[string]FieldInfo, len(fields))
 	jsonbFields := make(map[string]bool)
 	for _, f := range fields {
@@ -128,9 +126,8 @@ func (e *InvalidFieldError) Error() string {
 	return fmt.Sprintf("invalid field '%s' in query; valid fields are: %s", e.Field, strings.Join(e.ValidFields, ", "))
 }
 
-// getStructFields extracts field information from a struct using reflection.
-// It sets ImplicitSearch=true for string fields (text-like) and ImplicitSearch=false for
-// other types (int, time, uuid, etc.) following the same logic as schema introspection.
+// getStructFields uses reflection to extract field metadata from a struct.
+// String fields get ImplicitSearch=true, others get ImplicitSearch=false.
 func getStructFields(model any) ([]FieldInfo, error) {
 	t := reflect.TypeOf(model)
 	if t.Kind() == reflect.Ptr {
@@ -156,13 +153,11 @@ func getStructFields(model any) ([]FieldInfo, error) {
 		gormTag := field.Tag.Get("gorm")
 		isJSONB := strings.Contains(gormTag, "type:jsonb")
 
-		// Check if the lucene tag explicitly sets implicit search behavior
 		luceneTag := field.Tag.Get("lucene")
 		implicitSearch := false
 		if luceneTag == "implicit" {
 			implicitSearch = true
 		} else if luceneTag != "explicit" {
-			// Auto-detect: string types are implicit, others require explicit field:value
 			implicitSearch = field.Type.Kind() == reflect.String && !isJSONB
 		}
 
@@ -255,7 +250,6 @@ func (p *Parser) ParseToDynamoDBPartiQL(query string) (string, []types.Attribute
 	return partiql, attrs, nil
 }
 
-// validateQuery checks security limits.
 func (p *Parser) validateQuery(query string) error {
 	if len(query) > p.MaxQueryLength {
 		return fmt.Errorf("query too long: %d bytes exceeds maximum of %d bytes", len(query), p.MaxQueryLength)
@@ -274,7 +268,6 @@ func (p *Parser) validateQuery(query string) error {
 	return nil
 }
 
-// calculateNestingDepth calculates the maximum nesting depth of parentheses and brackets.
 func calculateNestingDepth(query string) int {
 	maxDepth := 0
 	currentDepth := 0
@@ -283,19 +276,16 @@ func calculateNestingDepth(query string) int {
 	for i := 0; i < len(query); i++ {
 		c := query[i]
 
-		// Handle escaped characters
 		if c == '\\' && i+1 < len(query) {
-			i++ // Skip the escaped character
+			i++
 			continue
 		}
 
-		// Handle quotes
 		if c == '"' {
 			inQuotes = !inQuotes
 			continue
 		}
 
-		// Only count nesting when not in quotes
 		if !inQuotes {
 			switch c {
 			case '(', '[', '{':
@@ -312,9 +302,9 @@ func calculateNestingDepth(query string) int {
 	return maxDepth
 }
 
-// countTerms counts the number of search terms in a query.
-// A term is a field:value pair, an implicit search term, or a quoted phrase.
-// Operators (AND, OR, NOT) and parentheses are not counted as terms.
+// countTerms counts search terms in a query.
+// Terms include field:value pairs, implicit terms, and quoted phrases.
+// Operators (AND, OR, NOT) and parentheses are excluded.
 func countTerms(query string) int {
 	if query == "" {
 		return 0
@@ -328,23 +318,19 @@ func countTerms(query string) int {
 	for i := 0; i < len(query); i++ {
 		c := query[i]
 
-		// Handle escaped characters
 		if c == '\\' && i+1 < len(query) {
-			i++ // Skip the escaped character
+			i++
 			currentTerm = true
 			continue
 		}
 
-		// Handle quotes
 		if c == '"' {
 			if !inQuotes {
-				// Start of quoted term
 				if currentTerm {
 					terms++
 				}
 				currentTerm = true
 			} else {
-				// End of quoted term
 				if currentTerm {
 					terms++
 					currentTerm = false
@@ -354,7 +340,6 @@ func countTerms(query string) int {
 			continue
 		}
 
-		// Handle range brackets
 		if !inQuotes {
 			if c == '[' || c == '{' {
 				inRange = true
@@ -374,7 +359,6 @@ func countTerms(query string) int {
 			}
 		}
 
-		// Handle spaces (term separators) when not in quotes or range
 		if c == ' ' && !inQuotes && !inRange {
 			if currentTerm {
 				terms++
@@ -383,7 +367,6 @@ func countTerms(query string) int {
 			continue
 		}
 
-		// Handle parentheses - don't count as terms
 		if !inQuotes && !inRange && (c == '(' || c == ')') {
 			if currentTerm {
 				terms++
@@ -392,32 +375,27 @@ func countTerms(query string) int {
 			continue
 		}
 
-		// Handle operators (AND, OR, NOT) - they don't count as terms
 		if !inQuotes && !inRange && currentTerm {
 			remaining := query[i:]
 			if strings.HasPrefix(remaining, "AND ") || strings.HasPrefix(remaining, "OR ") ||
 				strings.HasPrefix(remaining, "NOT ") || strings.HasPrefix(remaining, "and ") ||
 				strings.HasPrefix(remaining, "or ") || strings.HasPrefix(remaining, "not ") {
-				// End current term before operator
 				terms++
 				currentTerm = false
-				// Skip the operator
 				if len(remaining) >= 3 && (remaining[0] == 'A' || remaining[0] == 'a') {
-					i += 3 // AND
+					i += 3
 				} else if len(remaining) >= 3 && (remaining[0] == 'N' || remaining[0] == 'n') {
-					i += 3 // NOT
+					i += 3
 				} else {
-					i += 2 // OR
+					i += 2
 				}
 				continue
 			}
 		}
 
-		// Any other character is part of a term
 		currentTerm = true
 	}
 
-	// Count the last term if present
 	if currentTerm {
 		terms++
 	}
@@ -425,28 +403,22 @@ func countTerms(query string) int {
 	return terms
 }
 
-// ValidateFields extracts all field references from a query and validates they exist in the model.
-// Returns InvalidFieldError if any field is not found.
+// ValidateFields returns InvalidFieldError if the query references non-existent fields.
 func (p *Parser) ValidateFields(query string) error {
-	// Extract all field:value patterns from the query
 	matches := fieldExtractPattern.FindAllStringSubmatchIndex(query, -1)
 	if len(matches) == 0 {
-		return nil // No explicit fields to validate
+		return nil
 	}
 
-	// Collect all valid field names for error message
 	validFields := p.getValidFieldNames()
 
 	for _, match := range matches {
 		if len(match) < 4 {
 			continue
 		}
-		// match[0] = full match start, match[1] = full match end
-		// match[2] = first group start, match[3] = first group end
 		fieldStart := match[2]
 		fieldEnd := match[3]
 
-		// Skip if this match is inside a quoted string
 		if isInsideQuotes(query, fieldStart) {
 			continue
 		}
@@ -464,17 +436,14 @@ func (p *Parser) ValidateFields(query string) error {
 	return nil
 }
 
-// isInsideQuotes checks if a position in the query string is inside a quoted string.
 func isInsideQuotes(query string, pos int) bool {
 	inQuotes := false
 	for i := 0; i < pos && i < len(query); i++ {
 		c := query[i]
-		// Handle escaped characters
 		if c == '\\' && i+1 < len(query) {
-			i++ // Skip the escaped character
+			i++
 			continue
 		}
-		// Toggle quote state
 		if c == '"' {
 			inQuotes = !inQuotes
 		}
@@ -482,10 +451,8 @@ func isInsideQuotes(query string, pos int) bool {
 	return inQuotes
 }
 
-// validateFieldName checks if a field name is valid.
-// Handles both simple fields (e.g., "name") and JSONB sub-fields (e.g., "labels.category")
+// validateFieldName validates both simple fields (name) and JSONB sub-fields (labels.category).
 func (p *Parser) validateFieldName(fieldName string) error {
-	// Check for JSONB sub-field notation (e.g., "labels.category")
 	if strings.Contains(fieldName, ".") {
 		parts := strings.SplitN(fieldName, ".", 2)
 		if len(parts) != 2 {
@@ -494,7 +461,6 @@ func (p *Parser) validateFieldName(fieldName string) error {
 
 		baseField := parts[0]
 
-		// Check if base field exists and is JSONB
 		if !p.jsonbFields[baseField] {
 			if _, exists := p.fieldMap[baseField]; !exists {
 				return fmt.Errorf("field '%s' does not exist", baseField)
@@ -502,11 +468,9 @@ func (p *Parser) validateFieldName(fieldName string) error {
 			return fmt.Errorf("field '%s' is not a JSONB field; cannot use sub-field notation", baseField)
 		}
 
-		// JSONB sub-fields are allowed (any sub-field name is valid for JSONB)
 		return nil
 	}
 
-	// Check if field exists
 	if _, exists := p.fieldMap[fieldName]; !exists {
 		return fmt.Errorf("field '%s' does not exist", fieldName)
 	}
@@ -514,7 +478,6 @@ func (p *Parser) validateFieldName(fieldName string) error {
 	return nil
 }
 
-// getValidFieldNames returns a list of valid field names for error messages
 func (p *Parser) getValidFieldNames() []string {
 	var names []string
 	for _, f := range p.Fields {
@@ -527,7 +490,6 @@ func (p *Parser) getValidFieldNames() []string {
 	return names
 }
 
-// getImplicitSearchFields returns all fields marked for implicit search (ImplicitSearch=true)
 func (p *Parser) getImplicitSearchFields() []FieldInfo {
 	var fields []FieldInfo
 	for _, field := range p.Fields {
@@ -538,7 +500,7 @@ func (p *Parser) getImplicitSearchFields() []FieldInfo {
 	return fields
 }
 
-// isImplicitTerm checks if a token is an implicit search term (not a field:value, operator, or range)
+// isImplicitTerm returns true if token is a search term without an explicit field prefix.
 func isImplicitTerm(token string) bool {
 	token = strings.TrimSpace(token)
 	if token == "" {
@@ -643,7 +605,7 @@ func (p *Parser) expandImplicitTerms(query string) string {
 	return strings.Join(result, " ")
 }
 
-// tokenizeQuery splits a Lucene query into tokens while preserving quoted strings and ranges
+// tokenizeQuery splits query into tokens, preserving quoted strings and range brackets.
 func tokenizeQuery(query string) []string {
 	var tokens []string
 	var current strings.Builder
@@ -708,8 +670,7 @@ func tokenizeQuery(query string) []string {
 	return tokens
 }
 
-// parseWithImplicitSearch parses a query with implicit search support.
-// If the query contains unfielded terms, it expands them across all implicit search fields with OR.
+// parseWithImplicitSearch expands unfielded terms across all implicit search fields with OR.
 func (p *Parser) parseWithImplicitSearch(query string) (*expr.Expression, error) {
 	query = strings.TrimSpace(query)
 	if query == "" {
@@ -733,7 +694,7 @@ func (p *Parser) parseWithImplicitSearch(query string) (*expr.Expression, error)
 	return lucene.Parse(expandedQuery, lucene.WithDefaultField(fallbackField))
 }
 
-// exprToMap converts an expression to a map representation (legacy format).
+// exprToMap converts expression to map format (legacy, kept for backward compatibility).
 func (p *Parser) exprToMap(e *expr.Expression) map[string]any {
 	if e == nil {
 		return nil
@@ -770,7 +731,6 @@ func (p *Parser) exprToMap(e *expr.Expression) map[string]any {
 	return result
 }
 
-// valueToAny converts expression values to any type.
 func (p *Parser) valueToAny(v any) any {
 	switch val := v.(type) {
 	case *expr.Expression:

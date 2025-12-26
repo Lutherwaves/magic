@@ -16,7 +16,6 @@ type PostgresJSONBDriver struct {
 	fields map[string]FieldInfo // Map of field names to their metadata
 }
 
-// NewPostgresJSONBDriver creates a new PostgreSQL driver with JSONB support.
 func NewPostgresJSONBDriver(fields []FieldInfo) *PostgresJSONBDriver {
 	fieldMap := make(map[string]FieldInfo)
 	for _, f := range fields {
@@ -95,15 +94,13 @@ func (p *PostgresJSONBDriver) renderParamInternal(e *expr.Expression) (string, [
 	}
 }
 
-// renderLikeOrWild handles LIKE and Wild operators, converting them to PostgreSQL ILIKE.
+// renderLikeOrWild converts LIKE and Wild operators to PostgreSQL ILIKE for case-insensitive matching.
 func (p *PostgresJSONBDriver) renderLikeOrWild(e *expr.Expression) (string, []any, error) {
-	// Get the left side (column name)
 	leftStr, leftParams, err := p.serializeColumn(e.Left)
 	if err != nil {
 		return "", nil, err
 	}
 
-	// Get the right side value (the pattern)
 	rightStr, rightParams, err := p.serializeValue(e.Right)
 	if err != nil {
 		return "", nil, err
@@ -111,7 +108,6 @@ func (p *PostgresJSONBDriver) renderLikeOrWild(e *expr.Expression) (string, []an
 
 	params := append(leftParams, rightParams...)
 
-	// Check if left contains JSONB syntax
 	if isJSONBSyntax(leftStr) {
 		return fmt.Sprintf("%s ILIKE %s", leftStr, rightStr), params, nil
 	}
@@ -125,19 +121,16 @@ func (p *PostgresJSONBDriver) renderLikeOrWild(e *expr.Expression) (string, []an
 // - Left: Equals expression (name:roam) with Left=Column("name"), Right=Literal("roam")
 // - Right: nil (distance stored in unexported fuzzyDistance field)
 func (p *PostgresJSONBDriver) renderFuzzy(e *expr.Expression) (string, []any, error) {
-	// Left side must be an Equals expression (field:value)
 	leftExpr, ok := e.Left.(*expr.Expression)
 	if !ok || leftExpr.Op != expr.Equals {
 		return "", nil, fmt.Errorf("fuzzy operator requires field:value syntax (e.g., name:roam~2)")
 	}
 
-	// Extract column from the Equals expression's left side
 	colStr, colParams, err := p.serializeColumn(leftExpr.Left)
 	if err != nil {
 		return "", nil, err
 	}
 
-	// Extract search term from the Equals expression's right side
 	termStr, termParams, err := p.serializeValue(leftExpr.Right)
 	if err != nil {
 		return "", nil, err
@@ -145,28 +138,23 @@ func (p *PostgresJSONBDriver) renderFuzzy(e *expr.Expression) (string, []any, er
 
 	params := append(colParams, termParams...)
 
-	// Use similarity threshold of 0.3 (default for fuzzy search)
-	// Lower threshold = more matches, higher = stricter matching
-	// The fuzzy distance from go-lucene is not directly accessible (unexported),
-	// so we use a reasonable default threshold
+	// Use threshold 0.3 (lower = more matches, higher = stricter).
+	// The fuzzy distance from go-lucene is unexported, so we use a reasonable default.
 	threshold := 0.3
 
-	// For JSONB fields, we need to cast to text for similarity
 	if isJSONBSyntax(colStr) {
 		return fmt.Sprintf("similarity(%s, %s) > %f", colStr, termStr, threshold), params, nil
 	}
 	return fmt.Sprintf("similarity(%s::text, %s) > %f", colStr, termStr, threshold), params, nil
 }
 
-// renderComparison handles comparison operators (=, >, <, >=, <=) with nil/null support.
+// renderComparison handles comparison operators with IS NULL support for nil/null values.
 func (p *PostgresJSONBDriver) renderComparison(e *expr.Expression) (string, []any, error) {
-	// Get the left side (column name)
 	leftStr, leftParams, err := p.serializeColumn(e.Left)
 	if err != nil {
 		return "", nil, err
 	}
 
-	// Check if right side is nil/null for IS NULL handling
 	if isNilValue(e.Right) {
 		if e.Op == expr.Equals {
 			return fmt.Sprintf("%s IS NULL", leftStr), leftParams, nil
@@ -174,7 +162,6 @@ func (p *PostgresJSONBDriver) renderComparison(e *expr.Expression) (string, []an
 		return "", nil, fmt.Errorf("cannot use comparison operators (>, <, >=, <=) with nil value")
 	}
 
-	// Get the right side value
 	rightStr, rightParams, err := p.serializeValue(e.Right)
 	if err != nil {
 		return "", nil, err
@@ -182,7 +169,6 @@ func (p *PostgresJSONBDriver) renderComparison(e *expr.Expression) (string, []an
 
 	params := append(leftParams, rightParams...)
 
-	// Determine the operator symbol
 	var opSymbol string
 	switch e.Op {
 	case expr.Equals:
@@ -200,17 +186,15 @@ func (p *PostgresJSONBDriver) renderComparison(e *expr.Expression) (string, []an
 	return fmt.Sprintf("%s %s %s", leftStr, opSymbol, rightStr), params, nil
 }
 
-// renderBinary handles binary operators (AND, OR, Must, MustNot) with recursive rendering.
-// Note: Must and MustNot are unary operators (only Right operand), while And and Or are binary.
+// renderBinary handles binary and unary logical operators recursively.
+// Note: Must and MustNot are unary (only Left operand), while And and Or are binary.
 func (p *PostgresJSONBDriver) renderBinary(e *expr.Expression) (string, []any, error) {
 	switch e.Op {
 	case expr.Must, expr.MustNot:
-		// Unary operators: operand is in Left (not Right)
 		if e.Left == nil {
 			return "", nil, fmt.Errorf("%s operator requires a left operand", e.Op)
 		}
 
-		// Try to render Left as an expression first
 		if leftExpr, ok := e.Left.(*expr.Expression); ok {
 			leftStr, leftParams, err := p.renderParamInternal(leftExpr)
 			if err != nil {
@@ -220,18 +204,13 @@ func (p *PostgresJSONBDriver) renderBinary(e *expr.Expression) (string, []any, e
 			if e.Op == expr.Must {
 				return leftStr, leftParams, nil
 			}
-			// MustNot
 			return fmt.Sprintf("NOT (%s)", leftStr), leftParams, nil
 		}
 
-		// If Left is not an expression, try to render it directly
-		// This handles cases where Left might be a Column, Literal, etc.
 		leftStr, leftParams, err := p.serializeColumn(e.Left)
 		if err != nil {
-			// Try as a value if column serialization fails
 			leftStr, leftParams, err = p.serializeValue(e.Left)
 			if err != nil {
-				// Fallback to base implementation if we can't serialize
 				return p.Base.RenderParam(e)
 			}
 		}
@@ -239,11 +218,9 @@ func (p *PostgresJSONBDriver) renderBinary(e *expr.Expression) (string, []any, e
 		if e.Op == expr.Must {
 			return leftStr, leftParams, nil
 		}
-		// MustNot
 		return fmt.Sprintf("NOT (%s)", leftStr), leftParams, nil
 
 	case expr.And, expr.Or:
-		// Binary operators: both Left and Right operands are required
 		if e.Left == nil || e.Right == nil {
 			return "", nil, fmt.Errorf("%s operator requires both left and right operands", e.Op)
 		}
@@ -252,7 +229,6 @@ func (p *PostgresJSONBDriver) renderBinary(e *expr.Expression) (string, []any, e
 		rightExpr, rightIsExpr := e.Right.(*expr.Expression)
 
 		if !leftIsExpr || !rightIsExpr {
-			// Fallback to base implementation if operands aren't expressions
 			return p.Base.RenderParam(e)
 		}
 
@@ -271,7 +247,6 @@ func (p *PostgresJSONBDriver) renderBinary(e *expr.Expression) (string, []any, e
 		if e.Op == expr.And {
 			return fmt.Sprintf("(%s) AND (%s)", leftStr, rightStr), params, nil
 		}
-		// Or
 		return fmt.Sprintf("(%s) OR (%s)", leftStr, rightStr), params, nil
 
 	default:
@@ -279,61 +254,51 @@ func (p *PostgresJSONBDriver) renderBinary(e *expr.Expression) (string, []any, e
 	}
 }
 
-// serializeColumn serializes a column reference.
 func (p *PostgresJSONBDriver) serializeColumn(in any) (string, []any, error) {
 	switch v := in.(type) {
 	case expr.Column:
 		colStr := string(v)
-		// Don't quote JSONB syntax (contains ->>)
 		if isJSONBSyntax(colStr) {
 			return colStr, nil, nil
 		}
 		return fmt.Sprintf(`"%s"`, colStr), nil, nil
 	case string:
-		// Handle string columns (for some operators)
 		if isJSONBSyntax(v) {
 			return v, nil, nil
 		}
 		return fmt.Sprintf(`"%s"`, v), nil, nil
 	case *expr.Expression:
-		// Handle LITERAL(COLUMN(...)) pattern
 		if v.Op == expr.Literal && v.Left != nil {
 			if col, ok := v.Left.(expr.Column); ok {
 				colStr := string(col)
-				// Don't quote JSONB syntax
 				if isJSONBSyntax(colStr) {
 					return colStr, nil, nil
 				}
 				return fmt.Sprintf(`"%s"`, colStr), nil, nil
 			}
 		}
-		// For other expressions, recursively render using our custom logic
 		return p.renderParamInternal(v)
 	default:
 		return "", nil, fmt.Errorf("unexpected column type: %T", v)
 	}
 }
 
-// serializeValue serializes a value with wildcard conversion.
+// serializeValue converts Lucene wildcards (* and ?) to SQL wildcards (% and _).
 func (p *PostgresJSONBDriver) serializeValue(in any) (string, []any, error) {
 	switch v := in.(type) {
 	case string:
 		return "?", []any{convertWildcards(v)}, nil
 	case *expr.Expression:
-		// For LITERAL expressions, extract the value and convert wildcards
 		if v.Op == expr.Literal && v.Left != nil {
 			literalVal := fmt.Sprintf("%v", v.Left)
 			return "?", []any{convertWildcards(literalVal)}, nil
 		}
-		// For WILD expressions, extract the pattern from Left
 		if v.Op == expr.Wild && v.Left != nil {
 			literalVal := fmt.Sprintf("%v", v.Left)
 			return "?", []any{convertWildcards(literalVal)}, nil
 		}
-		// For nested expressions, recursively render
 		return p.renderParamInternal(v)
 	case nil:
-		// Handle nil value - this can happen with malformed expressions
 		return "", nil, fmt.Errorf("nil value in expression")
 	default:
 		return "?", []any{v}, nil
@@ -416,14 +381,12 @@ func convertWildcards(s string) string {
 	return result.String()
 }
 
-// isJSONBSyntax checks if a column string contains JSONB accessor syntax.
 func isJSONBSyntax(col string) bool {
 	return strings.Contains(col, "->>")
 }
 
-// isNilValue checks if a value represents nil/null in Lucene query syntax.
-// Supports: nil, null, NULL (case-insensitive)
-// Note: We intentionally do NOT support "empty" as it could be a legitimate search value.
+// isNilValue checks if a value represents nil/null (case-insensitive).
+// Note: "empty" is intentionally NOT treated as nil - it's a valid search value.
 func isNilValue(v any) bool {
 	strVal := extractStringValue(v)
 	if strVal == "" {
@@ -433,7 +396,6 @@ func isNilValue(v any) bool {
 	return lower == "nil" || lower == "null"
 }
 
-// extractStringValue extracts a string value from various expression types.
 func extractStringValue(v any) string {
 	switch val := v.(type) {
 	case string:
@@ -448,7 +410,6 @@ func extractStringValue(v any) string {
 	return ""
 }
 
-// extractLiteralValue extracts the literal value from an expression or returns it as-is.
 func extractLiteralValue(v any) string {
 	if v == nil {
 		return ""
@@ -468,41 +429,34 @@ func extractLiteralValue(v any) string {
 	return fmt.Sprintf("%v", v)
 }
 
-// renderRange handles range expressions with support for open-ended ranges (*).
+// renderRange handles range queries including open-ended ranges with wildcards (*).
 func (p *PostgresJSONBDriver) renderRange(e *expr.Expression) (string, []any, error) {
-	// Get column name
 	colStr, _, err := p.serializeColumn(e.Left)
 	if err != nil {
 		return "", nil, err
 	}
 
-	// The Right side should be a RangeBoundary
 	rangeBoundary, ok := e.Right.(*expr.RangeBoundary)
 	if !ok {
 		return "", nil, fmt.Errorf("invalid range expression structure: expected *expr.RangeBoundary, got %T", e.Right)
 	}
 
-	// Extract min and max values by rendering them
 	var minVal, maxVal string
 	var params []any
 
-	// Extract Min value
 	if rangeBoundary.Min != nil {
 		minVal = extractLiteralValue(rangeBoundary.Min)
 	}
 
-	// Extract Max value
 	if rangeBoundary.Max != nil {
 		maxVal = extractLiteralValue(rangeBoundary.Max)
 	}
 
-	// Handle open-ended ranges
 	if minVal == "*" && maxVal == "*" {
 		return "", nil, fmt.Errorf("both range bounds cannot be wildcards")
 	}
 
 	if minVal == "*" {
-		// [* TO max] or {* TO max}
 		params = append(params, maxVal)
 		if rangeBoundary.Inclusive {
 			return fmt.Sprintf("%s <= ?", colStr), params, nil
@@ -511,7 +465,6 @@ func (p *PostgresJSONBDriver) renderRange(e *expr.Expression) (string, []any, er
 	}
 
 	if maxVal == "*" {
-		// [min TO *] or {min TO *}
 		params = append(params, minVal)
 		if rangeBoundary.Inclusive {
 			return fmt.Sprintf("%s >= ?", colStr), params, nil
@@ -519,7 +472,6 @@ func (p *PostgresJSONBDriver) renderRange(e *expr.Expression) (string, []any, er
 		return fmt.Sprintf("%s > ?", colStr), params, nil
 	}
 
-	// Both bounds specified
 	params = append(params, minVal, maxVal)
 	if rangeBoundary.Inclusive {
 		return fmt.Sprintf("%s BETWEEN ? AND ?", colStr), params, nil
@@ -533,7 +485,6 @@ type DynamoDBPartiQLDriver struct {
 	fields map[string]FieldInfo
 }
 
-// NewDynamoDBPartiQLDriver creates a new DynamoDB PartiQL driver.
 func NewDynamoDBPartiQLDriver(fields []FieldInfo) *DynamoDBPartiQLDriver {
 	fieldMap := make(map[string]FieldInfo)
 	for _, f := range fields {
