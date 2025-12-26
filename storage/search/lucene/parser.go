@@ -1,8 +1,6 @@
 package lucene
 
 import (
-	"context"
-	"database/sql"
 	"fmt"
 	"log/slog"
 	"reflect"
@@ -42,88 +40,41 @@ type Parser struct {
 }
 
 // NewParserFromType creates a parser by introspecting a struct's fields.
+// This is the recommended approach for initializing parsers as it:
+// - Works with any backend (PostgreSQL, MySQL, DynamoDB, etc.)
+// - Zero database overhead
+// - Compile-time safety
+// - Auto-detects JSONB fields from gorm tags
+// - Auto-sets string fields as searchable (IsDefault=true)
+//
+// Example:
+//
+//	type Task struct {
+//	    ID          string    `json:"id"`
+//	    Name        string    `json:"name"`                         // Auto: IsDefault=true
+//	    Description string    `json:"description"`                  // Auto: IsDefault=true
+//	    Status      string    `json:"status" lucene:"nodefault"`    // Explicit: IsDefault=false
+//	    CreatedAt   time.Time `json:"created_at"`                   // Auto: IsDefault=false (not string)
+//	    Labels      JSONB     `json:"labels" gorm:"type:jsonb"`     // Auto: IsJSONB=true, IsDefault=false
+//	}
+//
+//	parser, err := lucene.NewParserFromType(Task{})
+//
+// Struct tag controls:
+// - lucene:"default"   - Force IsDefault=true (include in implicit search)
+// - lucene:"nodefault" - Force IsDefault=false (require explicit field prefix)
+// - gorm:"type:jsonb"  - Auto-detected as JSONB field
+//
+// Auto-detection rules (when no lucene tag):
+// - String fields: IsDefault=true (searchable in implicit queries)
+// - Non-string fields (int, time.Time, uuid, etc.): IsDefault=false
+// - JSONB fields: IsDefault=false (require field.subfield syntax)
 func NewParserFromType(model any) (*Parser, error) {
 	fields, err := getStructFields(model)
 	if err != nil {
 		return nil, err
 	}
 	return NewParser(fields), nil
-}
-
-// NewParserFromSchema creates a parser by introspecting the database schema.
-// This automatically detects column types and sets sensible defaults:
-// - JSONB columns: IsJSONB = true
-// - Text/varchar columns: IsDefault = true (searchable in implicit queries)
-// - Other columns: IsDefault = false (require explicit field prefix)
-//
-// Example:
-//
-//	parser, err := lucene.NewParserFromSchema(ctx, db, "tasks")
-//	sql, params, err := parser.ParseToSQL("Paint")  // Searches text columns automatically
-func NewParserFromSchema(ctx context.Context, db *sql.DB, tableName string) (*Parser, error) {
-	fields, err := introspectSchema(ctx, db, tableName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to introspect schema for table %s: %w", tableName, err)
-	}
-	return NewParser(fields), nil
-}
-
-// introspectSchema queries PostgreSQL's information_schema to auto-detect columns.
-func introspectSchema(ctx context.Context, db *sql.DB, tableName string) ([]FieldInfo, error) {
-	query := `
-		SELECT column_name, data_type, udt_name
-		FROM information_schema.columns
-		WHERE table_name = $1
-		ORDER BY ordinal_position
-	`
-
-	rows, err := db.QueryContext(ctx, query, tableName)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query schema: %w", err)
-	}
-	defer rows.Close()
-
-	var fields []FieldInfo
-	for rows.Next() {
-		var columnName, dataType, udtName string
-		if err := rows.Scan(&columnName, &dataType, &udtName); err != nil {
-			return nil, fmt.Errorf("failed to scan row: %w", err)
-		}
-
-		field := FieldInfo{
-			Name:      columnName,
-			IsJSONB:   udtName == "jsonb" || dataType == "jsonb",
-			IsDefault: isTextType(dataType, udtName),
-		}
-		fields = append(fields, field)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating rows: %w", err)
-	}
-
-	if len(fields) == 0 {
-		return nil, fmt.Errorf("no columns found for table %s", tableName)
-	}
-
-	return fields, nil
-}
-
-// isTextType determines if a column type should be searchable by default.
-// Text-like columns (varchar, text, char) are good candidates for implicit search.
-// Structured data (int, date, uuid, jsonb) should require explicit field prefixes.
-func isTextType(dataType, udtName string) bool {
-	textTypes := map[string]bool{
-		"text":             true,
-		"character varying": true,
-		"varchar":          true,
-		"character":        true,
-		"char":             true,
-		"name":             true, // PostgreSQL's internal type for names
-	}
-
-	// Check both data_type and udt_name
-	return textTypes[strings.ToLower(dataType)] || textTypes[strings.ToLower(udtName)]
 }
 
 // NewParser creates a new Lucene query parser with the given default fields.
