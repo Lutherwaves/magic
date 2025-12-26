@@ -357,9 +357,9 @@ func TestComplexQueries(t *testing.T) {
 // TestImplicitSearch tests implicit search across default fields
 func TestImplicitSearch(t *testing.T) {
 	fields := []FieldInfo{
-		{Name: "name", IsJSONB: false},
-		{Name: "email", IsJSONB: false},
-		{Name: "description", IsJSONB: false},
+		{Name: "name", IsJSONB: false, IsDefault: true},
+		{Name: "email", IsJSONB: false, IsDefault: true},
+		{Name: "description", IsJSONB: false, IsDefault: true},
 	}
 	parser := NewParser(fields)
 
