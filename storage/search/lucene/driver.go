@@ -148,18 +148,18 @@ func (p *PostgresJSONBDriver) renderFuzzy(e *expr.Expression) (string, []any, er
 	return fmt.Sprintf("similarity(%s::text, %s) > %f", colStr, termStr, threshold), params, nil
 }
 
-// renderComparison handles comparison operators with IS NULL support for nil/null values.
+// renderComparison handles comparison operators with IS NULL support for null values.
 func (p *PostgresJSONBDriver) renderComparison(e *expr.Expression) (string, []any, error) {
 	leftStr, leftParams, err := p.serializeColumn(e.Left)
 	if err != nil {
 		return "", nil, err
 	}
 
-	if isNilValue(e.Right) {
+	if isNullValue(e.Right) {
 		if e.Op == expr.Equals {
 			return fmt.Sprintf("%s IS NULL", leftStr), leftParams, nil
 		}
-		return "", nil, fmt.Errorf("cannot use comparison operators (>, <, >=, <=) with nil value")
+		return "", nil, fmt.Errorf("cannot use comparison operators (>, <, >=, <=) with null value")
 	}
 
 	rightStr, rightParams, err := p.serializeValue(e.Right)
@@ -385,15 +385,17 @@ func isJSONBSyntax(col string) bool {
 	return strings.Contains(col, "->>")
 }
 
-// isNilValue checks if a value represents nil/null (case-insensitive).
-// Note: "empty" is intentionally NOT treated as nil - it's a valid search value.
-func isNilValue(v any) bool {
+// isNullValue checks if a value represents null in Lucene query syntax.
+// Supports: null, NULL, Null (case-insensitive)
+// Note: This is a SQL-specific extension (vanilla Lucene doesn't support NULL values).
+// We intentionally do NOT support "empty" or "nil" as they could be legitimate search values.
+func isNullValue(v any) bool {
 	strVal := extractStringValue(v)
 	if strVal == "" {
 		return false
 	}
 	lower := strings.ToLower(strVal)
-	return lower == "nil" || lower == "null"
+	return lower == "null"
 }
 
 func extractStringValue(v any) string {

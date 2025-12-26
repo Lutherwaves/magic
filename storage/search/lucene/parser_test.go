@@ -598,8 +598,10 @@ func TestValidateFields(t *testing.T) {
 	}
 }
 
-// TestNilValueQueries tests nil/null value handling for IS NULL queries
-func TestNilValueQueries(t *testing.T) {
+// TestNullValueQueries tests null value handling for IS NULL queries.
+// Note: This is a SQL-specific extension (vanilla Lucene doesn't support NULL values).
+// Only "null" (case-insensitive) is supported for IS NULL queries; "nil" is treated as a literal string.
+func TestNullValueQueries(t *testing.T) {
 	fields := []FieldInfo{
 		{Name: "name", IsJSONB: false},
 		{Name: "parent_id", IsJSONB: false},
@@ -615,11 +617,6 @@ func TestNilValueQueries(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			name:    "field is nil",
-			query:   "deleted_at:nil",
-			wantSQL: "IS NULL",
-		},
-		{
 			name:    "field is null (lowercase)",
 			query:   "deleted_at:null",
 			wantSQL: "IS NULL",
@@ -630,19 +627,30 @@ func TestNilValueQueries(t *testing.T) {
 			wantSQL: "IS NULL",
 		},
 		{
-			name:    "parent_id is nil",
-			query:   "parent_id:nil",
+			name:    "field is Null (mixed case)",
+			query:   "deleted_at:Null",
 			wantSQL: "IS NULL",
 		},
 		{
-			name:    "combined nil with other conditions",
-			query:   "deleted_at:nil AND name:john",
+			name:    "parent_id is null",
+			query:   "parent_id:null",
 			wantSQL: "IS NULL",
 		},
 		{
-			name:    "NOT nil (is not null)",
-			query:   "NOT deleted_at:nil",
+			name:    "combined null with other conditions",
+			query:   "deleted_at:null AND name:john",
+			wantSQL: "IS NULL",
+		},
+		{
+			name:    "NOT null (is not null)",
+			query:   "NOT deleted_at:null",
 			wantSQL: "NOT",
+		},
+		{
+			name:    "nil should be treated as literal value (not NULL)",
+			query:   "name:nil",
+			wantSQL: "=",
+			wantErr: false, // Should not error, but should treat "nil" as literal string, not IS NULL
 		},
 	}
 
