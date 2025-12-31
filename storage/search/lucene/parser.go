@@ -39,6 +39,19 @@ type ParserConfig struct {
 	LuceneTag string // Lucene tag name (default: "lucene")
 }
 
+// IntPtr is a helper function to create int pointers for ParserConfig.
+// This makes it easier to set optional configuration values.
+//
+// Example:
+//
+//	config := &ParserConfig{
+//	    MaxQueryLength: IntPtr(5000),
+//	    MaxDepth:       IntPtr(10),
+//	}
+func IntPtr(i int) *int {
+	return &i
+}
+
 // FieldInfo describes a searchable field and its properties.
 type FieldInfo struct {
 	Name           string
@@ -82,6 +95,14 @@ type Parser struct {
 //
 //	parser, err := lucene.NewParserFromType(Task{})
 //
+// With custom configuration:
+//
+//	config := &lucene.ParserConfig{
+//	    MaxQueryLength: lucene.IntPtr(5000),
+//	    MaxDepth:       lucene.IntPtr(10),
+//	}
+//	parser, err := lucene.NewParserFromType(Task{}, config)
+//
 // Struct tag controls:
 // - lucene:"implicit" - Force ImplicitSearch=true (include in unfielded queries)
 // - lucene:"explicit" - Force ImplicitSearch=false (require field:value syntax)
@@ -91,25 +112,39 @@ type Parser struct {
 // - String fields: ImplicitSearch=true (included in unfielded queries)
 // - Non-string fields (int, time.Time, uuid, etc.): ImplicitSearch=false
 // - JSONB fields: ImplicitSearch=false (require field.subfield syntax)
-func NewParserFromType(model any) (*Parser, error) {
-	return NewParserFromTypeWithConfig(model, nil)
-}
+func NewParserFromType(model any, config ...*ParserConfig) (*Parser, error) {
+	var cfg *ParserConfig
+	if len(config) > 0 && config[0] != nil {
+		cfg = config[0]
+	}
 
-// NewParserFromTypeWithConfig creates a parser with custom configuration.
-func NewParserFromTypeWithConfig(model any, config *ParserConfig) (*Parser, error) {
-	fields, err := getStructFieldsWithConfig(model, config)
+	fields, err := getStructFieldsWithConfig(model, cfg)
 	if err != nil {
 		return nil, err
 	}
-	return NewParserWithConfig(fields, config), nil
+	return NewParser(fields, cfg), nil
 }
 
-func NewParser(fields []FieldInfo) *Parser {
-	return NewParserWithConfig(fields, nil)
-}
+// NewParser creates a parser from field definitions with optional configuration.
+//
+// Basic usage:
+//
+//	fields := []FieldInfo{{Name: "name", ImplicitSearch: true}}
+//	parser := lucene.NewParser(fields)
+//
+// With custom configuration:
+//
+//	config := &lucene.ParserConfig{
+//	    MaxQueryLength: lucene.IntPtr(5000),
+//	    MaxDepth:       lucene.IntPtr(10),
+//	}
+//	parser := lucene.NewParser(fields, config)
+func NewParser(fields []FieldInfo, config ...*ParserConfig) *Parser {
+	var cfg *ParserConfig
+	if len(config) > 0 && config[0] != nil {
+		cfg = config[0]
+	}
 
-// NewParserWithConfig creates a parser with custom configuration.
-func NewParserWithConfig(fields []FieldInfo, config *ParserConfig) *Parser {
 	fieldMap := make(map[string]FieldInfo, len(fields))
 	jsonbFields := make(map[string]bool)
 	for _, f := range fields {
@@ -124,15 +159,15 @@ func NewParserWithConfig(fields []FieldInfo, config *ParserConfig) *Parser {
 	maxDepth := DefaultMaxDepth
 	maxTerms := DefaultMaxTerms
 
-	if config != nil {
-		if config.MaxQueryLength != nil {
-			maxQueryLength = *config.MaxQueryLength
+	if cfg != nil {
+		if cfg.MaxQueryLength != nil {
+			maxQueryLength = *cfg.MaxQueryLength
 		}
-		if config.MaxDepth != nil {
-			maxDepth = *config.MaxDepth
+		if cfg.MaxDepth != nil {
+			maxDepth = *cfg.MaxDepth
 		}
-		if config.MaxTerms != nil {
-			maxTerms = *config.MaxTerms
+		if cfg.MaxTerms != nil {
+			maxTerms = *cfg.MaxTerms
 		}
 	}
 
