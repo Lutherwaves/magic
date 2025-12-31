@@ -203,12 +203,6 @@ func (e *InvalidFieldError) Error() string {
 	return fmt.Sprintf("invalid field '%s' in query; valid fields are: %s", e.Field, strings.Join(e.ValidFields, ", "))
 }
 
-// getStructFields uses reflection to extract field metadata from a struct.
-// String fields get ImplicitSearch=true, others get ImplicitSearch=false.
-func getStructFields(model any) ([]FieldInfo, error) {
-	return getStructFieldsWithConfig(model, nil)
-}
-
 // getStructFieldsWithConfig extracts field metadata using configurable tag names.
 func getStructFieldsWithConfig(model any, config *ParserConfig) ([]FieldInfo, error) {
 	t := reflect.TypeOf(model)
